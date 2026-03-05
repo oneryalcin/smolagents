@@ -93,6 +93,7 @@ from .utils import (
     make_init_file,
     parse_code_blobs,
     truncate_content,
+    MAX_LENGTH_TRUNCATE_CONTENT,
 )
 
 
@@ -1521,6 +1522,7 @@ class CodeAgent(MultiStepAgent):
 
             <Added version="1.17.0"/>
         code_block_tags (`tuple[str, str]` | `Literal["markdown"]`, *optional*): Opening and closing tags for code blocks (regex strings). Pass a custom tuple, or pass 'markdown' to use ("```(?:python|py)", "\\n```"), leave empty to use ("<code>", "</code>").
+        max_output_length (`int`, *optional*): Maximum character length for code output truncation in observations. If not provided, defaults to 20,000. Set lower (e.g. 2000-5000) to force the agent to write code for data exploration instead of reading raw output.
         **kwargs: Additional keyword arguments.
     """
 
@@ -1538,11 +1540,15 @@ class CodeAgent(MultiStepAgent):
         stream_outputs: bool = False,
         use_structured_outputs_internally: bool = False,
         code_block_tags: str | tuple[str, str] | None = None,
+        max_output_length: int | None = None,
         **kwargs,
     ):
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
         self.max_print_outputs_length = max_print_outputs_length
+        if max_output_length is not None and max_output_length <= 0:
+            raise ValueError(f"max_output_length must be positive, got {max_output_length}")
+        self.max_output_length = max_output_length
         self._use_structured_outputs_internally = use_structured_outputs_internally
         if self._use_structured_outputs_internally:
             prompt_templates = prompt_templates or yaml.safe_load(
@@ -1750,7 +1756,10 @@ class CodeAgent(MultiStepAgent):
                 )
             raise AgentExecutionError(error_msg, self.logger)
 
-        truncated_output = truncate_content(str(code_output.output))
+        truncated_output = truncate_content(
+            str(code_output.output),
+            max_length=self.max_output_length or MAX_LENGTH_TRUNCATE_CONTENT,
+        )
         observation += "Last output from code snippet:\n" + truncated_output
         memory_step.observations = observation
 
