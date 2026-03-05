@@ -22,9 +22,10 @@ Usage:
 from typing import Any
 
 from smolagents.agents import CodeAgent
+from smolagents.memory import ActionStep
 from smolagents.models import Model
 from smolagents.monitoring import LogLevel
-from smolagents.rlm_tools import LLMQueryBatchedTool, LLMQueryTool
+from smolagents.rlm_tools import Budget, BudgetManager, LLMQueryBatchedTool, LLMQueryTool
 
 
 # ---------------------------------------------------------------------------
@@ -119,12 +120,16 @@ You have `context` in your Python environment and two sub-LLM tools:
 # RLMAgent
 # ---------------------------------------------------------------------------
 
+_SUPER_RUN_PARAMS = {"reset", "max_steps", "stream", "images", "return_full_result"}
+
+
 class RLMAgent(CodeAgent):
     """CodeAgent extended with sub-LLM tools for large-context processing.
 
     Args:
         model: Main orchestrator model (writes Python code).
         sub_model: Model used for llm_query / llm_query_batched. Defaults to `model`.
+        budget: Optional budget limits for sub-LLM calls (call count, tokens).
         max_output_length: Truncation limit for code output. Lower values force the
             LLM to write smarter code instead of reading raw output. Default 3000.
         max_workers: Max parallel threads for llm_query_batched. Default 8.
@@ -136,16 +141,18 @@ class RLMAgent(CodeAgent):
         self,
         model: Model,
         sub_model: Model | None = None,
+        budget: Budget | None = None,
         max_output_length: int = 3000,
         max_workers: int = 8,
         tools: list | None = None,
         **kwargs,
     ):
         sub_model = sub_model or model
+        self.budget_manager = BudgetManager(budget) if budget else None
 
         rlm_tools = [
-            LLMQueryTool(model=sub_model),
-            LLMQueryBatchedTool(model=sub_model, max_workers=max_workers),
+            LLMQueryTool(model=sub_model, budget_manager=self.budget_manager),
+            LLMQueryBatchedTool(model=sub_model, max_workers=max_workers, budget_manager=self.budget_manager),
         ]
         all_tools = rlm_tools + (tools or [])
 
@@ -163,18 +170,19 @@ class RLMAgent(CodeAgent):
         # Per-instance set of state keys to clear between runs
         self._rlm_state_keys: set[str] = set()
 
-    def run(
-        self,
-        task: str,
-        context=None,
-        show_metadata: bool = True,
-        reset: bool = True,
-        max_steps: int | None = None,
-        stream: bool = False,
-        images=None,
-        return_full_result: bool | None = None,
-        **kwargs,
-    ):
+        # Register budget callback to inject summary into observations
+        if self.budget_manager:
+            self.step_callbacks.register(ActionStep, self._budget_callback)
+
+    def _budget_callback(self, memory_step, agent=None):
+        """Append budget summary to step observations so the LLM sees remaining budget."""
+        summary = self.budget_manager.summary
+        if memory_step.observations:
+            memory_step.observations += f"\n[Budget] {summary}"
+        else:
+            memory_step.observations = f"[Budget] {summary}"
+
+    def run(self, task: str, context=None, show_metadata: bool = True, **kwargs):
         """Run the RLM agent on a task with optional large context.
 
         Args:
@@ -182,13 +190,13 @@ class RLMAgent(CodeAgent):
             context: Large data to process (str, list, dict, etc.).
                 Stored in agent state, not in the prompt.
             show_metadata: Log variable metadata.
-            reset: Reset memory between runs (default True).
-            max_steps: Override max steps for this run.
-            stream: Whether to stream outputs.
-            images: Optional images to pass.
-            return_full_result: Whether to return RunResult or just output.
-            **kwargs: Extra data variables. Strings >1000 chars auto-routed to state.
+            **kwargs: Passed to CodeAgent.run() (reset, max_steps, stream, images, etc.)
+                Strings >1000 chars are auto-routed to agent state instead.
         """
+        # Reset budget counters for this run
+        if self.budget_manager:
+            self.budget_manager.reset()
+
         # Clear state keys from previous run to prevent cross-run leakage
         for key in self._rlm_state_keys:
             self.state.pop(key, None)
@@ -196,6 +204,7 @@ class RLMAgent(CodeAgent):
 
         additional_args = {}
         variables_info: list[str] = []
+        super_kwargs = {}
 
         # Route context into state with metadata preview
         if context is not None:
@@ -206,9 +215,11 @@ class RLMAgent(CodeAgent):
             if show_metadata:
                 self.logger.log(f"\n{'='*60}\n{info}\n{'='*60}", level=LogLevel.INFO)
 
-        # Route large string kwargs to state, keep small values as additional_args
+        # Separate super().run() kwargs from data kwargs
         for k, v in kwargs.items():
-            if isinstance(v, str) and len(v) > 1000:
+            if k in _SUPER_RUN_PARAMS:
+                super_kwargs[k] = v
+            elif isinstance(v, str) and len(v) > 1000:
                 self.state[k] = v
                 self._rlm_state_keys.add(k)
                 info = make_variable_info(k, v, preview_chars=200)
@@ -219,12 +230,4 @@ class RLMAgent(CodeAgent):
         if variables_info:
             additional_args["variables_info"] = "\n\n".join(variables_info)
 
-        return super().run(
-            task=task,
-            additional_args=additional_args,
-            reset=reset,
-            max_steps=max_steps,
-            stream=stream,
-            images=images,
-            return_full_result=return_full_result,
-        )
+        return super().run(task=task, additional_args=additional_args, **super_kwargs)
