@@ -686,7 +686,7 @@ class TestAgentLogging:
         context = "\n".join(f"Entry {i}: color={'red' if i%7==0 else 'blue'}" for i in range(10))
 
         agent.run(task="Count reds", context=context)
-        # Logger closed by run() — no manual close needed
+        agent.close()
 
         events = _read_events(path)
         event_types = [e["event_type"] for e in events]
@@ -709,6 +709,7 @@ class TestAgentLogging:
         model = FakeOrchestratorModel()
         agent = RLMAgent(model=model, max_steps=3, log_path=str(path))
         agent.run(task="Count reds", context="Entry 0: red")
+        agent.close()
 
         events = _read_events(path)
         end = next(e for e in events if e["event_type"] == "agent_end")
@@ -719,6 +720,7 @@ class TestAgentLogging:
         model = FakeOrchestratorModel()
         agent = RLMAgent(model=model, max_steps=3, log_path=str(path))
         agent.run(task="Find red entries", context="Entry 0: red")
+        agent.close()
 
         events = _read_events(path)
         start = next(e for e in events if e["event_type"] == "agent_start")
@@ -740,6 +742,7 @@ class TestAgentLogging:
             log_path=str(path), max_steps=5,
         )
         agent.run(task="Classify", context="data")
+        agent.close()
 
         events = _read_events(path)
         llm_calls = [e for e in events if e["event_type"] == "llm_call"]
@@ -752,6 +755,7 @@ class TestAgentLogging:
         model = FakeOrchestratorModel()
         agent = RLMAgent(model=model, max_steps=3, log_path=str(path))
         agent.run(task="Count", context="Entry 0: red")
+        agent.close()
 
         events = _read_events(path)
         exec_events = [e for e in events if e["event_type"] == "execution_result"]
@@ -759,3 +763,30 @@ class TestAgentLogging:
         for e in exec_events:
             assert "has_error" in e
             assert "hasError" not in e
+
+    def test_multi_run_logging(self, tmp_path):
+        """Logger survives across multiple run() calls."""
+        path = tmp_path / "multi.jsonl"
+        model = FakeOrchestratorModel()
+        agent = RLMAgent(model=model, max_steps=3, log_path=str(path))
+        agent.run(task="Run 1", context="Entry 0: red")
+        agent.run(task="Run 2", context="Entry 0: blue")
+        agent.close()
+
+        events = _read_events(path)
+        starts = [e for e in events if e["event_type"] == "agent_start"]
+        ends = [e for e in events if e["event_type"] == "agent_end"]
+        assert len(starts) == 2
+        assert len(ends) == 2
+        assert starts[0]["task"] == "Run 1"
+        assert starts[1]["task"] == "Run 2"
+
+    def test_context_manager(self, tmp_path):
+        """RLMAgent as context manager closes logger on exit."""
+        path = tmp_path / "ctx.jsonl"
+        model = FakeOrchestratorModel()
+        with RLMAgent(model=model, max_steps=3, log_path=str(path)) as agent:
+            agent.run(task="test", context="Entry 0: red")
+        # Logger should be closed, file readable
+        events = _read_events(path)
+        assert any(e["event_type"] == "agent_start" for e in events)

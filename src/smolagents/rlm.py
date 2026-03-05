@@ -271,5 +271,18 @@ class RLMAgent(CodeAgent):
         finally:
             if self.rlm_logger:
                 self.rlm_logger.emit("agent_end", success=success)
-                self.rlm_logger.close()
         return result
+
+    def close(self):
+        """Close the JSONL logger. Safe to call multiple times."""
+        if self.rlm_logger:
+            self.rlm_logger.close()
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
