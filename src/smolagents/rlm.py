@@ -19,10 +19,11 @@ Usage:
     )
 """
 
+from pathlib import Path
 from typing import Any
 
 from smolagents.agents import CodeAgent
-from smolagents.memory import ActionStep
+from smolagents.memory import ActionStep, FinalAnswerStep
 from smolagents.models import Model
 from smolagents.monitoring import LogLevel
 from smolagents.rlm_tools import Budget, BudgetManager, LLMQueryBatchedTool, LLMQueryTool
@@ -142,6 +143,7 @@ class RLMAgent(CodeAgent):
         model: Model,
         sub_model: Model | None = None,
         budget: Budget | None = None,
+        log_path: str | Path | None = None,
         max_output_length: int = 3000,
         max_workers: int = 8,
         tools: list | None = None,
@@ -150,9 +152,18 @@ class RLMAgent(CodeAgent):
         sub_model = sub_model or model
         self.budget_manager = BudgetManager(budget) if budget else None
 
+        # Lazy import — zero cost when logging disabled
+        self.rlm_logger = None
+        if log_path:
+            from smolagents.rlm_logging import RLMLogger
+            self.rlm_logger = RLMLogger(log_path)
+
         rlm_tools = [
-            LLMQueryTool(model=sub_model, budget_manager=self.budget_manager),
-            LLMQueryBatchedTool(model=sub_model, max_workers=max_workers, budget_manager=self.budget_manager),
+            LLMQueryTool(model=sub_model, budget_manager=self.budget_manager, rlm_logger=self.rlm_logger),
+            LLMQueryBatchedTool(
+                model=sub_model, max_workers=max_workers,
+                budget_manager=self.budget_manager, rlm_logger=self.rlm_logger,
+            ),
         ]
         all_tools = rlm_tools + (tools or [])
 
@@ -174,6 +185,11 @@ class RLMAgent(CodeAgent):
         if self.budget_manager:
             self.step_callbacks.register(ActionStep, self._budget_callback)
 
+        # Register logging callbacks
+        if self.rlm_logger:
+            self.step_callbacks.register(ActionStep, self._log_action_step)
+            self.step_callbacks.register(FinalAnswerStep, self._log_final_answer)
+
     def _budget_callback(self, memory_step, agent=None):
         """Append budget summary to step observations so the LLM sees remaining budget."""
         summary = self.budget_manager.summary
@@ -181,6 +197,27 @@ class RLMAgent(CodeAgent):
             memory_step.observations += f"\n[Budget] {summary}"
         else:
             memory_step.observations = f"[Budget] {summary}"
+
+    def _log_action_step(self, memory_step, agent=None):
+        """Emit execution_result JSONL event for each orchestrator step."""
+        from smolagents.rlm_logging import _format_usage, _ts
+
+        self.rlm_logger.emit(
+            "execution_result",
+            step=memory_step.step_number,
+            code=memory_step.code_action,
+            output=memory_step.observations,
+            hasError=memory_step.error is not None,
+            usage=_format_usage(memory_step.token_usage),
+            timestamps={
+                "llm_call_start": _ts(memory_step.timing.start_time),
+                "execution_end": _ts(memory_step.timing.end_time),
+            },
+        )
+
+    def _log_final_answer(self, memory_step, agent=None):
+        """Emit final_result JSONL event."""
+        self.rlm_logger.emit("final_result", result=str(memory_step.output))
 
     def run(self, task: str, context=None, show_metadata: bool = True, **kwargs):
         """Run the RLM agent on a task with optional large context.
@@ -230,4 +267,11 @@ class RLMAgent(CodeAgent):
         if variables_info:
             additional_args["variables_info"] = "\n\n".join(variables_info)
 
-        return super().run(task=task, additional_args=additional_args, **super_kwargs)
+        if self.rlm_logger:
+            self.rlm_logger.emit("agent_start", task=task[:500])
+        try:
+            result = super().run(task=task, additional_args=additional_args, **super_kwargs)
+        finally:
+            if self.rlm_logger:
+                self.rlm_logger.emit("agent_end")
+        return result

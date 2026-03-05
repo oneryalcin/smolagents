@@ -1,6 +1,8 @@
-"""Tests for RLM tools, budget, and agent."""
+"""Tests for RLM tools, budget, logging, and agent."""
 
+import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
@@ -9,6 +11,7 @@ from smolagents.memory import ActionStep
 from smolagents.models import ChatMessage, MessageRole, Model
 from smolagents.monitoring import TokenUsage
 from smolagents.rlm import RLMAgent, make_variable_info
+from smolagents.rlm_logging import RLMLogger, _format_usage, _ts
 from smolagents.rlm_tools import (
     Budget,
     BudgetExceededError,
@@ -472,3 +475,228 @@ class TestRLMAgent:
         # If max_steps wasn't forwarded, agent would use default 10
         # With max_steps=2 and FakeOrchestratorModel needing 2 steps, it should complete
         assert agent.step_number <= 3
+
+
+# ---------------------------------------------------------------------------
+# RLMLogger
+# ---------------------------------------------------------------------------
+
+
+def _read_events(path):
+    """Read JSONL file and return list of parsed dicts."""
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+class TestRLMLogger:
+    def test_emit_writes_valid_jsonl(self, tmp_path):
+        path = tmp_path / "test.jsonl"
+        logger = RLMLogger(path, run_id="test-run")
+        logger.emit("agent_start", task="hello")
+        logger.close()
+
+        events = _read_events(path)
+        assert len(events) == 1
+        e = events[0]
+        assert e["event_type"] == "agent_start"
+        assert e["run_id"] == "test-run"
+        assert e["level"] == 30
+        assert e["depth"] == 0
+        assert "time" in e
+        assert e["task"] == "hello"
+
+    def test_emit_thread_safety(self, tmp_path):
+        """20 threads writing concurrently — all lines present and valid JSON."""
+        path = tmp_path / "threaded.jsonl"
+        logger = RLMLogger(path, run_id="ts-test")
+
+        def write_event(i):
+            logger.emit("execution_result", step=i)
+
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            list(pool.map(write_event, range(20)))
+        logger.close()
+
+        events = _read_events(path)
+        assert len(events) == 20
+        steps = sorted(e["step"] for e in events)
+        assert steps == list(range(20))
+
+    def test_emit_sub_llm_schema(self, tmp_path):
+        """Sub-LLM events get their own run_id with parent_run_id pointing to agent."""
+        path = tmp_path / "sub.jsonl"
+        logger = RLMLogger(path, run_id="parent-123")
+        now = time.time()
+        logger.emit_sub_llm(
+            prompt="classify this text",
+            response="category A",
+            token_usage=TokenUsage(input_tokens=100, output_tokens=20),
+            call_start=now - 0.5,
+            call_end=now,
+        )
+        logger.close()
+
+        events = _read_events(path)
+        assert len(events) == 1
+        e = events[0]
+        assert e["event_type"] == "llm_call"
+        assert e["run_id"] != "parent-123"  # own run_id
+        assert e["parent_run_id"] == "parent-123"
+        assert e["depth"] == 1
+        assert e["usage"]["prompt_tokens"] == 100
+        assert e["usage"]["completion_tokens"] == 20
+        assert e["usage"]["total_tokens"] == 120
+        assert "llm_call_start" in e["timestamps"]
+        assert "llm_call_end" in e["timestamps"]
+
+    def test_sub_llm_truncates_long_prompts(self, tmp_path):
+        path = tmp_path / "trunc.jsonl"
+        logger = RLMLogger(path, run_id="trunc-test")
+        logger.emit_sub_llm(
+            prompt="x" * 5000,
+            response="y" * 5000,
+            token_usage=None,
+            call_start=time.time(),
+            call_end=time.time(),
+        )
+        logger.close()
+
+        events = _read_events(path)
+        assert len(events[0]["prompt"]) == 2000
+        assert len(events[0]["response"]) == 2000
+
+    def test_context_manager(self, tmp_path):
+        path = tmp_path / "ctx.jsonl"
+        with RLMLogger(path, run_id="ctx-test") as logger:
+            logger.emit("agent_start")
+        # File should be closed, readable
+        events = _read_events(path)
+        assert len(events) == 1
+
+    def test_mkdir_creates_parents(self, tmp_path):
+        path = tmp_path / "nested" / "deep" / "log.jsonl"
+        logger = RLMLogger(path, run_id="dir-test")
+        logger.emit("agent_start")
+        logger.close()
+        assert path.exists()
+
+
+class TestRLMLoggerHelpers:
+    def test_format_usage_with_tokens(self):
+        usage = _format_usage(TokenUsage(input_tokens=100, output_tokens=50))
+        assert usage["prompt_tokens"] == 100
+        assert usage["completion_tokens"] == 50
+        assert usage["total_tokens"] == 150
+        assert usage["cost"] is None
+
+    def test_format_usage_none(self):
+        assert _format_usage(None) is None
+
+    def test_ts_converts_epoch(self):
+        ts = _ts(0.0)
+        assert ts == "1970-01-01T00:00:00+00:00"
+
+    def test_ts_none(self):
+        assert _ts(None) is None
+
+
+class TestToolLogging:
+    def test_llm_query_emits_log(self, tmp_path):
+        """LLMQueryTool with logger emits llm_call event."""
+        path = tmp_path / "tool.jsonl"
+        logger = RLMLogger(path, run_id="tool-test")
+        model = FakeSubModel(response="classified", tokens=(50, 10))
+        tool = LLMQueryTool(model=model, rlm_logger=logger)
+
+        result = tool.forward("classify this")
+        logger.close()
+
+        assert result == "classified"
+        events = _read_events(path)
+        assert len(events) == 1
+        e = events[0]
+        assert e["event_type"] == "llm_call"
+        assert e["parent_run_id"] == "tool-test"
+        assert e["usage"]["prompt_tokens"] == 50
+
+    def test_llm_query_batched_emits_per_prompt(self, tmp_path):
+        """Batched tool emits one llm_call per prompt."""
+        path = tmp_path / "batched.jsonl"
+        logger = RLMLogger(path, run_id="batch-test")
+        model = FakeSubModel()
+        tool = LLMQueryBatchedTool(model=model, max_workers=4, rlm_logger=logger)
+
+        tool.forward(["p1", "p2", "p3"])
+        logger.close()
+
+        events = _read_events(path)
+        assert len(events) == 3
+        assert all(e["event_type"] == "llm_call" for e in events)
+        assert all(e["parent_run_id"] == "batch-test" for e in events)
+        # Each has unique run_id
+        run_ids = [e["run_id"] for e in events]
+        assert len(set(run_ids)) == 3
+
+    def test_no_logger_no_overhead(self):
+        """Tools with rlm_logger=None work unchanged."""
+        model = FakeSubModel()
+        tool = LLMQueryTool(model=model)
+        assert tool.forward("test") == "sub-response"
+
+
+class TestAgentLogging:
+    def test_agent_lifecycle_events(self, tmp_path):
+        """Agent run emits agent_start → execution_result(s) → final_result → agent_end."""
+        path = tmp_path / "agent.jsonl"
+        model = FakeOrchestratorModel()
+        agent = RLMAgent(model=model, max_steps=3, log_path=str(path))
+        context = "\n".join(f"Entry {i}: color={'red' if i%7==0 else 'blue'}" for i in range(10))
+
+        result = agent.run(task="Count reds", context=context)
+        agent.rlm_logger.close()
+
+        events = _read_events(path)
+        event_types = [e["event_type"] for e in events]
+        assert event_types[0] == "agent_start"
+        assert event_types[-1] == "agent_end"
+        assert "execution_result" in event_types
+        assert "final_result" in event_types
+        # All agent events share the same run_id
+        agent_run_id = events[0]["run_id"]
+        for e in events:
+            if e["event_type"] != "llm_call":
+                assert e["run_id"] == agent_run_id
+
+    def test_agent_start_contains_task(self, tmp_path):
+        path = tmp_path / "task.jsonl"
+        model = FakeOrchestratorModel()
+        agent = RLMAgent(model=model, max_steps=3, log_path=str(path))
+        agent.run(task="Find red entries", context="Entry 0: red")
+        agent.rlm_logger.close()
+
+        events = _read_events(path)
+        start = next(e for e in events if e["event_type"] == "agent_start")
+        assert "Find red entries" in start["task"]
+
+    def test_no_log_path_means_no_logger(self):
+        model = FakeSubModel()
+        agent = RLMAgent(model=model)
+        assert agent.rlm_logger is None
+
+    def test_sub_llm_calls_logged_during_run(self, tmp_path):
+        """When agent calls llm_query_batched, sub-LLM events appear in log."""
+        path = tmp_path / "sub_calls.jsonl"
+        sub_model = FakeSubModel()
+        orchestrator = FakeOrchestratorWithLLMQuery()
+        agent = RLMAgent(
+            model=orchestrator, sub_model=sub_model,
+            budget=Budget(max_llm_calls=5),
+            log_path=str(path), max_steps=5,
+        )
+        agent.run(task="Classify", context="data")
+        agent.rlm_logger.close()
+
+        events = _read_events(path)
+        llm_calls = [e for e in events if e["event_type"] == "llm_call"]
+        assert len(llm_calls) == 5  # budget limited to 5
+        assert all(e["depth"] == 1 for e in llm_calls)

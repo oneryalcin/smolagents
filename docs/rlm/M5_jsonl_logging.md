@@ -1,70 +1,91 @@
-# M5: JSONL Logging + fast-rlm TUI Compatibility
+# M5: JSONL Logging
 
-> **Status:** NOT STARTED
+> **Status:** COMPLETE
 > **Branch:** `feat/rlm`
 > **Depends on:** M1
 
 ## Goal
 
-Structured logs for debugging. Compatible with fast-rlm's TUI viewer.
+Structured JSONL logs for debugging RLM agent runs. Opt-in via `log_path` parameter.
 
-## What to Build
+## What Was Built
 
-### 1. `RLMJSONLLogger`
+### `RLMLogger` in `src/smolagents/rlm_logging.py`
 
-**New file:** `src/smolagents/rlm_logging.py`
+- Thread-safe JSONL writer (`threading.Lock` around write+flush)
+- `emit(event_type, **fields)` — single write path for all events
+- `emit_sub_llm(prompt, response, token_usage, call_start, call_end)` — convenience for sub-LLM call events
+- `_format_usage()` — converts smolagents `TokenUsage` to fast-rlm compatible dict
+- `_ts()` — epoch float to ISO 8601
+- Context manager support (`with RLMLogger(...) as logger:`)
+- `mkdir(parents=True)` on path creation
 
-Step callback emitting JSONL matching fast-rlm schema:
+### Wired into tools (`rlm_tools.py`)
 
-```json
-{
-  "time": "2026-03-04T...",
-  "run_id": "abc123",
-  "parent_run_id": null,
-  "depth": 0,
-  "step": 3,
-  "event_type": "execution_result",
-  "code": "chunks = ...",
-  "output": "[TRUNCATED]...",
-  "usage": {"prompt_tokens": 1234, "completion_tokens": 567},
-  "timestamps": {"llm_call_start": "...", "execution_end": "..."}
-}
+- Both `LLMQueryTool` and `LLMQueryBatchedTool` accept optional `rlm_logger`
+- Timing captured around `model.generate()` via `time.time()`
+- Each sub-LLM call emits an `llm_call` event with own `run_id`, parent's `run_id` as `parent_run_id`
+
+### Wired into agent (`rlm.py`)
+
+- `log_path: str | Path | None = None` parameter on `RLMAgent.__init__()`
+- Lazy import of `RLMLogger` (zero cost when disabled)
+- Step callbacks: `_log_action_step` (ActionStep → `execution_result`), `_log_final_answer` (FinalAnswerStep → `final_result`)
+- `run()` wrapped with `agent_start`/`agent_end` events (try/finally)
+
+### Tests: `tests/test_rlm.py` — 53 tests (36 existing + 17 new)
+
+New test classes: `TestRLMLogger` (6), `TestRLMLoggerHelpers` (4), `TestToolLogging` (3), `TestAgentLogging` (4)
+
+## Event Schema
+
+```
+agent.run(task, context)
+  ├─ emit("agent_start", task=...)
+  ├─ Step 1: LLM generates code → code executes
+  │   ├─ [during execution] llm_query → emit("llm_call", depth=1, own run_id)
+  │   ├─ [during execution] llm_query_batched → emit("llm_call") × N
+  │   └─ [step finalized] → emit("execution_result", step=1, code, output, usage)
+  ├─ Step 2: ...
+  ├─ emit("final_result", result=...)
+  └─ emit("agent_end")
 ```
 
-### 2. Sub-LLM call logging
+Each JSONL line has: `level=30`, `time` (ISO 8601), `run_id`, `parent_run_id`, `depth`, `event_type`, plus event-specific fields.
 
-Emit events from inside `LLMQueryTool` and `LLMQueryBatchedTool`, not just step callbacks. Each sub-call gets its own `run_id` with `parent_run_id` pointing to the parent agent.
+## fast-rlm TUI Compatibility
 
-### 3. fast-rlm TUI compatibility
+| fast-rlm event | Our event | Status |
+|---|---|---|
+| `agent_start` | `agent_start` | Compatible |
+| `agent_end` | `agent_end` | Compatible |
+| `execution_result` | `execution_result` | Compatible |
+| `code_generated` | — | Not emitted (smolagents callbacks fire post-execution) |
+| `final_result` | `final_result` | Compatible |
+| — | `llm_call` | Extra (sub-LLM calls, TUI ignores unknown types) |
 
-**Schema must match:** `src/logging.ts` in fast-rlm.
-Key fields: `event_type` ∈ {`agent_start`, `agent_end`, `execution_result`, `code_generated`, `final_result`}
+Tree rendering works via `run_id`/`parent_run_id` mapping.
 
-**Test:** `fast-rlm-log output.jsonl --tui` renders our logs correctly.
+## Design Decisions
 
-## fast-rlm Log Schema Reference
+1. **No stdlib logging** — smolagents uses it minimally. Our logger writes JSONL directly.
+2. **Lazy import** — `RLMLogger` only imported inside `if log_path:` branch.
+3. **Prompts/responses truncated to 2000 chars** in logs — full data in agent memory.
+4. **run_id format** — `{epoch_ms}-{hex9}` matches fast-rlm's `generateRunId()`.
+5. **No `step` field on sub-LLM events** — tools don't know which orchestrator step they're in. Tree structure suffices.
+6. **flush() after every write** — crash-safe logging.
 
-From `fast-rlm/src/logging.ts` and `tui_log_viewer/src/index.tsx`:
+## Usage
 
-```typescript
-interface LogEntry {
-  level: number;
-  time: string;
-  run_id: string;
-  parent_run_id?: string;
-  depth: number;
-  step?: number;
-  event_type: "execution_result" | "code_generated" | "final_result" | "agent_start" | "agent_end";
-  code?: string;
-  output?: string;
-  hasError?: boolean;
-  reasoning?: string;
-  usage?: Usage;
-  result?: unknown;
-  timestamps?: StepTimestamps;
-}
+```python
+from smolagents import LiteLLMModel
+from smolagents.rlm import RLMAgent
+
+agent = RLMAgent(
+    model=LiteLLMModel(model_id="gpt-4.1-mini"),
+    sub_model=LiteLLMModel(model_id="gpt-4.1-nano"),
+    log_path="logs/run.jsonl",
+)
+result = agent.run(task="Classify entries", context=large_text)
+# Inspect: cat logs/run.jsonl | python -m json.tool --json-lines
 ```
-
-## Implementation Notes
-
-*(to be filled during implementation)*

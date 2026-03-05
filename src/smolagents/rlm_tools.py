@@ -12,6 +12,7 @@ Most HTTP-based clients (LiteLLM, OpenAI SDK) are thread-safe.
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -132,14 +133,16 @@ class LLMQueryTool(Tool):
     }
     output_type = "string"
 
-    def __init__(self, model: Model, budget_manager: BudgetManager | None = None, **kwargs):
+    def __init__(self, model: Model, budget_manager: BudgetManager | None = None, rlm_logger=None, **kwargs):
         super().__init__(**kwargs)
         self.model = model
         self.budget_manager = budget_manager
+        self.rlm_logger = rlm_logger
 
     def forward(self, prompt: str) -> str:
         if self.budget_manager:
             self.budget_manager.pre_call_check()
+        call_start = time.time()
         try:
             messages = [ChatMessage(role=MessageRole.USER, content=prompt)]
             response = self.model.generate(messages)
@@ -147,8 +150,15 @@ class LLMQueryTool(Tool):
             if self.budget_manager:
                 self.budget_manager.release_call()
             raise
+        call_end = time.time()
         if self.budget_manager:
             self.budget_manager.record_usage(response.token_usage)
+        if self.rlm_logger:
+            self.rlm_logger.emit_sub_llm(
+                prompt=prompt, response=response.content or "",
+                token_usage=response.token_usage,
+                call_start=call_start, call_end=call_end,
+            )
         return response.content or ""
 
 
@@ -169,11 +179,12 @@ class LLMQueryBatchedTool(Tool):
     }
     output_type = "array"
 
-    def __init__(self, model: Model, max_workers: int = 8, budget_manager: BudgetManager | None = None, **kwargs):
+    def __init__(self, model: Model, max_workers: int = 8, budget_manager: BudgetManager | None = None, rlm_logger=None, **kwargs):
         super().__init__(**kwargs)
         self.model = model
         self.max_workers = max_workers
         self.budget_manager = budget_manager
+        self.rlm_logger = rlm_logger
 
     def forward(self, prompts: list) -> list:
         if not prompts:
@@ -182,9 +193,10 @@ class LLMQueryBatchedTool(Tool):
         n = len(prompts)
 
         def _query_one(prompt: str) -> str:
-            # NOTE: keep budget protocol in sync with LLMQueryTool.forward
+            # NOTE: keep budget + logging protocol in sync with LLMQueryTool.forward
             if self.budget_manager:
                 self.budget_manager.pre_call_check()
+            call_start = time.time()
             try:
                 messages = [ChatMessage(role=MessageRole.USER, content=prompt)]
                 response = self.model.generate(messages)
@@ -192,8 +204,15 @@ class LLMQueryBatchedTool(Tool):
                 if self.budget_manager:
                     self.budget_manager.release_call()
                 raise
+            call_end = time.time()
             if self.budget_manager:
                 self.budget_manager.record_usage(response.token_usage)
+            if self.rlm_logger:
+                self.rlm_logger.emit_sub_llm(
+                    prompt=prompt, response=response.content or "",
+                    token_usage=response.token_usage,
+                    call_start=call_start, call_end=call_end,
+                )
             return response.content or ""
 
         results = {}
