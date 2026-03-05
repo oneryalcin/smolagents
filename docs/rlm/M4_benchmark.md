@@ -38,6 +38,14 @@ From `oolongbench/oolong-synth` dataset:
 - Are `RLM_INSTRUCTIONS` effective?
 - Does LLM use `llm_query_batched` or loop sequentially?
 
+## Decision Gate: True Recursion
+
+After M4 results, evaluate whether flat map-reduce is sufficient:
+- If flat scores within 10% of fast-rlm on OOLONG → recursion is low priority
+- If flat fails on 10M+ scale or multi-hop tasks → implement recursion before M6
+
+Full recursion design, reference impl analysis, and implementation sketch: [`TRUE_RECURSION.md`](TRUE_RECURSION.md)
+
 ## Implementation Notes
 
 *(to be filled during implementation)*
