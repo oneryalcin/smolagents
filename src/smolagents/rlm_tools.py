@@ -117,12 +117,21 @@ class BudgetManager:
             self._total_tokens = 0
 
 
-def _execute_sub_llm(model: Model, prompt: str, budget_manager: BudgetManager | None, rlm_logger) -> str:
+def _execute_sub_llm(
+    model: Model, prompt: str, budget_manager: BudgetManager | None, rlm_logger,
+    max_prompt_chars: int | None = None,
+) -> str:
     """Execute a single sub-LLM call with budget tracking and logging.
 
     Shared by LLMQueryTool and LLMQueryBatchedTool to avoid protocol drift.
     Thread-safe: budget and logger handle their own locking.
     """
+    if max_prompt_chars and len(prompt) > max_prompt_chars:
+        raise ValueError(
+            f"Prompt too long: {len(prompt):,} chars (~{len(prompt) // 4:,} tokens). "
+            f"Max allowed: {max_prompt_chars:,} chars (~{max_prompt_chars // 4:,} tokens). "
+            f"Filter or chunk your data before calling llm_query."
+        )
     if budget_manager:
         budget_manager.pre_call_check()
     call_start = time.time()
@@ -161,14 +170,15 @@ class LLMQueryTool(Tool):
     }
     output_type = "string"
 
-    def __init__(self, model: Model, budget_manager: BudgetManager | None = None, rlm_logger=None, **kwargs):
+    def __init__(self, model: Model, budget_manager: BudgetManager | None = None, rlm_logger=None, max_prompt_chars: int | None = None, **kwargs):
         super().__init__(**kwargs)
         self.model = model
         self.budget_manager = budget_manager
         self.rlm_logger = rlm_logger
+        self.max_prompt_chars = max_prompt_chars
 
     def forward(self, prompt: str) -> str:
-        return _execute_sub_llm(self.model, prompt, self.budget_manager, self.rlm_logger)
+        return _execute_sub_llm(self.model, prompt, self.budget_manager, self.rlm_logger, self.max_prompt_chars)
 
 
 class LLMQueryBatchedTool(Tool):
@@ -188,12 +198,13 @@ class LLMQueryBatchedTool(Tool):
     }
     output_type = "array"
 
-    def __init__(self, model: Model, max_workers: int = 8, budget_manager: BudgetManager | None = None, rlm_logger=None, **kwargs):
+    def __init__(self, model: Model, max_workers: int = 8, budget_manager: BudgetManager | None = None, rlm_logger=None, max_prompt_chars: int | None = None, **kwargs):
         super().__init__(**kwargs)
         self.model = model
         self.max_workers = max_workers
         self.budget_manager = budget_manager
         self.rlm_logger = rlm_logger
+        self.max_prompt_chars = max_prompt_chars
 
     def forward(self, prompts: list) -> list:
         if not prompts:
@@ -203,7 +214,7 @@ class LLMQueryBatchedTool(Tool):
         results = {}
         with ThreadPoolExecutor(max_workers=min(self.max_workers, n)) as executor:
             futures = {
-                executor.submit(_execute_sub_llm, self.model, p, self.budget_manager, self.rlm_logger): i
+                executor.submit(_execute_sub_llm, self.model, p, self.budget_manager, self.rlm_logger, self.max_prompt_chars): i
                 for i, p in enumerate(prompts)
             }
             try:

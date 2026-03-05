@@ -10,7 +10,7 @@ import pytest
 from smolagents.memory import ActionStep
 from smolagents.models import ChatMessage, MessageRole, Model
 from smolagents.monitoring import TokenUsage
-from smolagents.rlm import RLMAgent, make_variable_info
+from smolagents.rlm import RLMAgent, _build_rlm_instructions, make_variable_info
 from smolagents.rlm_logging import RLMLogger, _format_usage, _truncate, _ts
 from smolagents.rlm_tools import (
     Budget,
@@ -18,6 +18,7 @@ from smolagents.rlm_tools import (
     BudgetManager,
     LLMQueryBatchedTool,
     LLMQueryTool,
+    _execute_sub_llm,
 )
 
 
@@ -790,3 +791,117 @@ class TestAgentLogging:
         # Logger should be closed, file readable
         events = _read_events(path)
         assert any(e["event_type"] == "agent_start" for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Prompt size guardrails
+# ---------------------------------------------------------------------------
+
+
+class TestPromptSizeGuardrail:
+    """Tests for max_prompt_chars enforcement on sub-LLM calls."""
+
+    def test_execute_sub_llm_rejects_oversized_prompt(self):
+        """_execute_sub_llm raises ValueError when prompt exceeds max_prompt_chars."""
+        model = FakeSubModel()
+        long_prompt = "x" * 10_000
+        with pytest.raises(ValueError, match="Prompt too long"):
+            _execute_sub_llm(model, long_prompt, None, None, max_prompt_chars=5_000)
+
+    def test_execute_sub_llm_allows_within_limit(self):
+        """Prompts within limit pass through normally."""
+        model = FakeSubModel()
+        result = _execute_sub_llm(model, "short prompt", None, None, max_prompt_chars=5_000)
+        assert result == "sub-response"
+
+    def test_execute_sub_llm_no_limit_allows_anything(self):
+        """max_prompt_chars=None means no enforcement."""
+        model = FakeSubModel()
+        result = _execute_sub_llm(model, "x" * 100_000, None, None, max_prompt_chars=None)
+        assert result == "sub-response"
+
+    def test_error_message_includes_counts(self):
+        """Error message shows actual/max chars and estimated tokens."""
+        model = FakeSubModel()
+        try:
+            _execute_sub_llm(model, "x" * 40_000, None, None, max_prompt_chars=32_000)
+            assert False, "should have raised"
+        except ValueError as e:
+            msg = str(e)
+            assert "40,000 chars" in msg
+            assert "10,000 tokens" in msg
+            assert "32,000 chars" in msg
+            assert "chunk" in msg.lower()
+
+    def test_llm_query_tool_enforces_limit(self):
+        """LLMQueryTool with max_prompt_chars rejects oversized prompts."""
+        tool = LLMQueryTool(model=FakeSubModel(), max_prompt_chars=1_000)
+        with pytest.raises(ValueError, match="Prompt too long"):
+            tool.forward("x" * 2_000)
+
+    def test_llm_query_batched_tool_enforces_limit(self):
+        """LLMQueryBatchedTool enforces per-prompt limit."""
+        tool = LLMQueryBatchedTool(model=FakeSubModel(), max_prompt_chars=1_000)
+        # One prompt too long, one OK
+        with pytest.raises(ValueError, match="Prompt too long"):
+            tool.forward(["short", "x" * 2_000])
+
+    def test_agent_default_limit(self):
+        """RLMAgent sets sub_model_max_chars=64000 by default."""
+        model = FakeOrchestratorModel()
+        agent = RLMAgent(model=model, max_steps=3)
+        # Check tools have the limit
+        llm_query = next(t for t in agent.tools.values() if t.name == "llm_query")
+        assert llm_query.max_prompt_chars == 64_000
+
+    def test_agent_custom_limit(self):
+        """RLMAgent passes custom sub_model_max_chars to tools."""
+        model = FakeOrchestratorModel()
+        agent = RLMAgent(model=model, max_steps=3, sub_model_max_chars=100_000)
+        llm_query = next(t for t in agent.tools.values() if t.name == "llm_query")
+        assert llm_query.max_prompt_chars == 100_000
+
+    def test_agent_no_limit(self):
+        """sub_model_max_chars=None disables enforcement."""
+        model = FakeOrchestratorModel()
+        agent = RLMAgent(model=model, max_steps=3, sub_model_max_chars=None)
+        llm_query = next(t for t in agent.tools.values() if t.name == "llm_query")
+        assert llm_query.max_prompt_chars is None
+
+
+class TestDynamicInstructions:
+    """Tests for _build_rlm_instructions with limit awareness."""
+
+    def test_instructions_include_limit(self):
+        """Instructions include sub-model char/token limits when set."""
+        instructions = _build_rlm_instructions(32_000)
+        assert "32,000 chars" in instructions
+        assert "8,000 tokens" in instructions
+        assert "NEVER pass raw" in instructions
+
+    def test_instructions_no_limit(self):
+        """Instructions omit limit section when sub_model_max_chars=None."""
+        instructions = _build_rlm_instructions(None)
+        assert "Sub-LLM Limits" not in instructions
+        assert "BATCH-CLASSIFY" in instructions  # other rules still present
+
+    def test_instructions_include_filter_pattern(self):
+        """Instructions include the batch-classify pattern."""
+        instructions = _build_rlm_instructions(32_000)
+        assert "BATCH-CLASSIFY" in instructions
+        assert "llm_query_batched" in instructions
+
+
+class TestTokenEstimateInMetadata:
+    """Tests for token estimate in make_variable_info."""
+
+    def test_string_metadata_includes_token_estimate(self):
+        """make_variable_info for strings includes estimated tokens."""
+        info = make_variable_info("data", "x" * 40_000)
+        assert "~10,000 tokens" in info
+        assert "40,000 chars" in info
+
+    def test_small_string_token_estimate(self):
+        """Token estimate works for small strings too."""
+        info = make_variable_info("data", "hello world")
+        assert "~2 tokens" in info

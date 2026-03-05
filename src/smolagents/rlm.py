@@ -42,11 +42,12 @@ def make_variable_info(name: str, value: Any, preview_chars: int = 1000) -> str:
     """
     if isinstance(value, str):
         lines = value.split("\n")
+        est_tokens = len(value) // 4
         preview = value[:preview_chars]
         truncated = len(value) > preview_chars
         return (
             f"Variable: `{name}`\n"
-            f"Type: str | Length: {len(value):,} chars | Lines: {len(lines):,}\n"
+            f"Type: str | Length: {len(value):,} chars (~{est_tokens:,} tokens) | Lines: {len(lines):,}\n"
             f"Preview (first {preview_chars} chars):\n```\n{preview}{'...' if truncated else ''}\n```"
         )
 
@@ -74,47 +75,88 @@ def make_variable_info(name: str, value: Any, preview_chars: int = 1000) -> str:
 # RLM instructions injected into system prompt
 # ---------------------------------------------------------------------------
 
-RLM_INSTRUCTIONS = """
+def _build_rlm_instructions(sub_model_max_chars: int | None) -> str:
+    """Build RLM instructions with optional sub-model limit awareness."""
+    limit_section = ""
+    if sub_model_max_chars:
+        est_tokens = sub_model_max_chars // 4
+        limit_section = f"""
+### Sub-LLM Limits
+- Each `llm_query` / `llm_query_batched` prompt accepts at most **{sub_model_max_chars:,} chars (~{est_tokens:,} tokens)**
+- Exceeding this limit raises an error — you MUST filter or chunk first
+- NEVER pass raw `context` to llm_query when context is larger than this limit
+"""
+
+    return f"""
 ## RLM: How to Handle Large Context
 
-You have `context` in your Python environment and two sub-LLM tools:
-- `llm_query(prompt)` — single sub-LLM call for semantic analysis
-- `llm_query_batched(prompts)` — parallel sub-LLM calls (list in, list out)
+You have `context` in your Python environment containing data that has NO pre-computed labels.
+You MUST explore it and use your sub-LLM tools to classify/analyze items when needed.
 
-### Rules
-1. **PEEK FIRST.** Always inspect before processing:
+**Tools:**
+- `llm_query(prompt)` — single sub-LLM call for semantic analysis
+- `llm_query_batched(prompts)` — parallel sub-LLM calls (list in, list out); much faster than a loop
+{limit_section}
+### Critical: Explore Before Answering
+Your first step MUST be to inspect the context structure and plan your approach.
+Do NOT jump to a final answer without first understanding the data format and size.
+The data typically has no explicit labels — YOU must classify items using the sub-LLM tools.
+
+### Strategy
+1. **PEEK** — inspect structure, size, and format:
    ```python
-   print(f"Length: {len(context):,} chars, Lines: {len(context.splitlines()):,}")
+   print(f"Length: {{len(context):,}} chars, Lines: {{len(context.splitlines()):,}}")
    print(context[:2000])
    ```
 
-2. **GREP before LLM.** String/regex matching is free and instant:
+2. **USE PYTHON FIRST** — string ops, regex, counting are free and instant:
    ```python
    import re
+   from collections import Counter
    matches = [l for l in context.splitlines() if 'keyword' in l.lower()]
+   dates = re.findall(r'Date: (\\w+ \\d+, \\d{{4}})', context)
    ```
 
-3. **BATCH for semantic tasks.** Chunk the data, send chunks in parallel:
+3. **BATCH-CLASSIFY with sub-LLM** — when semantic judgment is needed, batch 20-50 items per prompt:
    ```python
-   lines = context.splitlines()
-   chunk_size = max(1, len(lines) // 10)
-   chunks = [lines[i:i+chunk_size] for i in range(0, len(lines), chunk_size)]
-   prompts = [f"Classify these entries:\\n{chr(10).join(c)}" for c in chunks]
+   # Filter relevant items with Python (free)
+   items = [l for l in context.splitlines() if 'User: 12345' in l]
+   # Batch into chunks of ~40 items per prompt
+   chunk_size = 40
+   chunks = [items[i:i+chunk_size] for i in range(0, len(items), chunk_size)]
+   prompts = []
+   for chunk in chunks:
+       numbered = "\\n".join(f"{{j+1}}. {{item}}" for j, item in enumerate(chunk))
+       prompts.append(f"Classify each item as positive or negative. Return one label per line, in order.\\n{{numbered}}")
    results = llm_query_batched(prompts)
    ```
 
-4. **VERIFY before final_answer.** Print and sanity-check:
+4. **PARSE CAREFULLY** — when counting labels, avoid substring collisions:
    ```python
-   print(f"Found {count} matches")
-   print(sample[:5])
-   final_answer(count)
+   # WRONG: 'positive' in 'not positive' → True
+   # RIGHT: check exact word or exclude negations
+   for line in resp.strip().splitlines():
+       w = line.strip().lower()
+       if 'incorrect' in w:
+           labels.append('incorrect')
+       elif 'correct' in w:
+           labels.append('correct')
    ```
 
+5. **VERIFY** — print results and sanity-check before final_answer.
+
+### Batching Rules
+- **NEVER** send 1 item per LLM call when you have >10 items
+- 1000 items = ~25 prompts of 40, NOT 1000 prompts of 1
+- The sub-LLM is capable — don't under-use it. Feed substantial context per call.
+
 ### Don't waste LLM calls on:
-- Counting → `len()`, `sum()`
+- Counting → `len()`, `sum()`, `Counter()`
 - Pattern matching → `in`, `re.search()`
 - Filtering → list comprehensions
 - Sorting/grouping → `sorted()`, `itertools.groupby()`
+
+**IMPORTANT: Every response MUST contain a `<code>` block. Never respond with only text.**
 """
 
 
@@ -132,8 +174,9 @@ class RLMAgent(CodeAgent):
         model: Main orchestrator model (writes Python code).
         sub_model: Model used for llm_query / llm_query_batched. Defaults to `model`.
         budget: Optional budget limits for sub-LLM calls (call count, tokens).
-        max_output_length: Truncation limit for code output. Lower values force the
-            LLM to write smarter code instead of reading raw output. Default 3000.
+        sub_model_max_chars: Max chars per sub-LLM prompt. Forces chunking for
+            large inputs. Default 64000 (~16K tokens). Set None to disable.
+        max_output_length: Truncation limit for code output. Default 3000.
         max_workers: Max parallel threads for llm_query_batched. Default 8.
         tools: Additional tools beyond the RLM defaults.
         **kwargs: Passed to CodeAgent (max_steps, planning_interval, etc.)
@@ -145,6 +188,7 @@ class RLMAgent(CodeAgent):
         sub_model: Model | None = None,
         budget: Budget | None = None,
         log_path: str | Path | None = None,
+        sub_model_max_chars: int | None = 64_000,
         max_output_length: int = 3000,
         max_workers: int = 8,
         tools: list | None = None,
@@ -156,17 +200,21 @@ class RLMAgent(CodeAgent):
         self.rlm_logger = RLMLogger(log_path) if log_path else None
 
         rlm_tools = [
-            LLMQueryTool(model=sub_model, budget_manager=self.budget_manager, rlm_logger=self.rlm_logger),
+            LLMQueryTool(
+                model=sub_model, budget_manager=self.budget_manager,
+                rlm_logger=self.rlm_logger, max_prompt_chars=sub_model_max_chars,
+            ),
             LLMQueryBatchedTool(
                 model=sub_model, max_workers=max_workers,
                 budget_manager=self.budget_manager, rlm_logger=self.rlm_logger,
+                max_prompt_chars=sub_model_max_chars,
             ),
         ]
         all_tools = rlm_tools + (tools or [])
 
         # Inject RLM instructions into the system prompt via additional instructions
         base_instructions = kwargs.pop("instructions", "") or ""
-        kwargs["instructions"] = base_instructions + RLM_INSTRUCTIONS
+        kwargs["instructions"] = base_instructions + _build_rlm_instructions(sub_model_max_chars)
 
         super().__init__(
             tools=all_tools,
