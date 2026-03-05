@@ -11,7 +11,7 @@ from smolagents.memory import ActionStep
 from smolagents.models import ChatMessage, MessageRole, Model
 from smolagents.monitoring import TokenUsage
 from smolagents.rlm import RLMAgent, make_variable_info
-from smolagents.rlm_logging import RLMLogger, _format_usage, _ts
+from smolagents.rlm_logging import RLMLogger, _format_usage, _truncate, _ts
 from smolagents.rlm_tools import (
     Budget,
     BudgetExceededError,
@@ -580,6 +580,23 @@ class TestRLMLogger:
         logger.close()
         assert path.exists()
 
+    def test_emit_after_close_is_silent(self, tmp_path):
+        """Writes after close() are silently dropped, not crashes."""
+        path = tmp_path / "closed.jsonl"
+        logger = RLMLogger(path, run_id="closed-test")
+        logger.emit("agent_start")
+        logger.close()
+        logger.emit("should_be_dropped")  # must not raise
+        events = _read_events(path)
+        assert len(events) == 1
+        assert events[0]["event_type"] == "agent_start"
+
+    def test_double_close_is_safe(self, tmp_path):
+        path = tmp_path / "dbl.jsonl"
+        logger = RLMLogger(path, run_id="dbl-test")
+        logger.close()
+        logger.close()  # must not raise
+
 
 class TestRLMLoggerHelpers:
     def test_format_usage_with_tokens(self):
@@ -588,9 +605,16 @@ class TestRLMLoggerHelpers:
         assert usage["completion_tokens"] == 50
         assert usage["total_tokens"] == 150
         assert usage["cost"] is None
+        assert usage["cached_tokens"] is None  # unknown, not 0
+        assert usage["reasoning_tokens"] is None
 
     def test_format_usage_none(self):
         assert _format_usage(None) is None
+
+    def test_format_usage_non_token_usage_type(self):
+        """Non-TokenUsage truthy value should return None, not crash."""
+        assert _format_usage("not a token usage") is None
+        assert _format_usage(42) is None
 
     def test_ts_converts_epoch(self):
         ts = _ts(0.0)
@@ -598,6 +622,15 @@ class TestRLMLoggerHelpers:
 
     def test_ts_none(self):
         assert _ts(None) is None
+
+    def test_truncate_long_string(self):
+        assert len(_truncate("x" * 5000)) == 2000
+
+    def test_truncate_short_string(self):
+        assert _truncate("short") == "short"
+
+    def test_truncate_none(self):
+        assert _truncate(None) is None
 
 
 class TestToolLogging:
@@ -652,8 +685,8 @@ class TestAgentLogging:
         agent = RLMAgent(model=model, max_steps=3, log_path=str(path))
         context = "\n".join(f"Entry {i}: color={'red' if i%7==0 else 'blue'}" for i in range(10))
 
-        result = agent.run(task="Count reds", context=context)
-        agent.rlm_logger.close()
+        agent.run(task="Count reds", context=context)
+        # Logger closed by run() — no manual close needed
 
         events = _read_events(path)
         event_types = [e["event_type"] for e in events]
@@ -661,18 +694,31 @@ class TestAgentLogging:
         assert event_types[-1] == "agent_end"
         assert "execution_result" in event_types
         assert "final_result" in event_types
+        # final_result comes before agent_end
+        final_idx = event_types.index("final_result")
+        end_idx = event_types.index("agent_end")
+        assert final_idx < end_idx
         # All agent events share the same run_id
         agent_run_id = events[0]["run_id"]
         for e in events:
             if e["event_type"] != "llm_call":
                 assert e["run_id"] == agent_run_id
 
+    def test_agent_end_has_success_flag(self, tmp_path):
+        path = tmp_path / "success.jsonl"
+        model = FakeOrchestratorModel()
+        agent = RLMAgent(model=model, max_steps=3, log_path=str(path))
+        agent.run(task="Count reds", context="Entry 0: red")
+
+        events = _read_events(path)
+        end = next(e for e in events if e["event_type"] == "agent_end")
+        assert end["success"] is True
+
     def test_agent_start_contains_task(self, tmp_path):
         path = tmp_path / "task.jsonl"
         model = FakeOrchestratorModel()
         agent = RLMAgent(model=model, max_steps=3, log_path=str(path))
         agent.run(task="Find red entries", context="Entry 0: red")
-        agent.rlm_logger.close()
 
         events = _read_events(path)
         start = next(e for e in events if e["event_type"] == "agent_start")
@@ -694,9 +740,22 @@ class TestAgentLogging:
             log_path=str(path), max_steps=5,
         )
         agent.run(task="Classify", context="data")
-        agent.rlm_logger.close()
 
         events = _read_events(path)
         llm_calls = [e for e in events if e["event_type"] == "llm_call"]
         assert len(llm_calls) == 5  # budget limited to 5
         assert all(e["depth"] == 1 for e in llm_calls)
+
+    def test_execution_result_uses_snake_case(self, tmp_path):
+        """Verify has_error field uses snake_case, not camelCase."""
+        path = tmp_path / "snake.jsonl"
+        model = FakeOrchestratorModel()
+        agent = RLMAgent(model=model, max_steps=3, log_path=str(path))
+        agent.run(task="Count", context="Entry 0: red")
+
+        events = _read_events(path)
+        exec_events = [e for e in events if e["event_type"] == "execution_result"]
+        assert len(exec_events) > 0
+        for e in exec_events:
+            assert "has_error" in e
+            assert "hasError" not in e

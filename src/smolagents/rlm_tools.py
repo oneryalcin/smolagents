@@ -117,6 +117,34 @@ class BudgetManager:
             self._total_tokens = 0
 
 
+def _execute_sub_llm(model: Model, prompt: str, budget_manager: BudgetManager | None, rlm_logger) -> str:
+    """Execute a single sub-LLM call with budget tracking and logging.
+
+    Shared by LLMQueryTool and LLMQueryBatchedTool to avoid protocol drift.
+    Thread-safe: budget and logger handle their own locking.
+    """
+    if budget_manager:
+        budget_manager.pre_call_check()
+    call_start = time.time()
+    try:
+        messages = [ChatMessage(role=MessageRole.USER, content=prompt)]
+        response = model.generate(messages)
+    except Exception:
+        if budget_manager:
+            budget_manager.release_call()
+        raise
+    call_end = time.time()
+    if budget_manager:
+        budget_manager.record_usage(response.token_usage)
+    if rlm_logger:
+        rlm_logger.emit_sub_llm(
+            prompt=prompt, response=response.content or "",
+            token_usage=response.token_usage,
+            call_start=call_start, call_end=call_end,
+        )
+    return response.content or ""
+
+
 class LLMQueryTool(Tool):
     """Query a sub-LLM for semantic analysis of a chunk of text."""
 
@@ -140,26 +168,7 @@ class LLMQueryTool(Tool):
         self.rlm_logger = rlm_logger
 
     def forward(self, prompt: str) -> str:
-        if self.budget_manager:
-            self.budget_manager.pre_call_check()
-        call_start = time.time()
-        try:
-            messages = [ChatMessage(role=MessageRole.USER, content=prompt)]
-            response = self.model.generate(messages)
-        except Exception:
-            if self.budget_manager:
-                self.budget_manager.release_call()
-            raise
-        call_end = time.time()
-        if self.budget_manager:
-            self.budget_manager.record_usage(response.token_usage)
-        if self.rlm_logger:
-            self.rlm_logger.emit_sub_llm(
-                prompt=prompt, response=response.content or "",
-                token_usage=response.token_usage,
-                call_start=call_start, call_end=call_end,
-            )
-        return response.content or ""
+        return _execute_sub_llm(self.model, prompt, self.budget_manager, self.rlm_logger)
 
 
 class LLMQueryBatchedTool(Tool):
@@ -191,33 +200,12 @@ class LLMQueryBatchedTool(Tool):
             return []
 
         n = len(prompts)
-
-        def _query_one(prompt: str) -> str:
-            # NOTE: keep budget + logging protocol in sync with LLMQueryTool.forward
-            if self.budget_manager:
-                self.budget_manager.pre_call_check()
-            call_start = time.time()
-            try:
-                messages = [ChatMessage(role=MessageRole.USER, content=prompt)]
-                response = self.model.generate(messages)
-            except Exception:
-                if self.budget_manager:
-                    self.budget_manager.release_call()
-                raise
-            call_end = time.time()
-            if self.budget_manager:
-                self.budget_manager.record_usage(response.token_usage)
-            if self.rlm_logger:
-                self.rlm_logger.emit_sub_llm(
-                    prompt=prompt, response=response.content or "",
-                    token_usage=response.token_usage,
-                    call_start=call_start, call_end=call_end,
-                )
-            return response.content or ""
-
         results = {}
         with ThreadPoolExecutor(max_workers=min(self.max_workers, n)) as executor:
-            futures = {executor.submit(_query_one, p): i for i, p in enumerate(prompts)}
+            futures = {
+                executor.submit(_execute_sub_llm, self.model, p, self.budget_manager, self.rlm_logger): i
+                for i, p in enumerate(prompts)
+            }
             try:
                 for future in as_completed(futures):
                     results[futures[future]] = future.result()

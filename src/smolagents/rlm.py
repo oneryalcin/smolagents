@@ -26,6 +26,7 @@ from smolagents.agents import CodeAgent
 from smolagents.memory import ActionStep, FinalAnswerStep
 from smolagents.models import Model
 from smolagents.monitoring import LogLevel
+from smolagents.rlm_logging import RLMLogger, _format_usage, _truncate, _ts
 from smolagents.rlm_tools import Budget, BudgetManager, LLMQueryBatchedTool, LLMQueryTool
 
 
@@ -152,11 +153,7 @@ class RLMAgent(CodeAgent):
         sub_model = sub_model or model
         self.budget_manager = BudgetManager(budget) if budget else None
 
-        # Lazy import — zero cost when logging disabled
-        self.rlm_logger = None
-        if log_path:
-            from smolagents.rlm_logging import RLMLogger
-            self.rlm_logger = RLMLogger(log_path)
+        self.rlm_logger = RLMLogger(log_path) if log_path else None
 
         rlm_tools = [
             LLMQueryTool(model=sub_model, budget_manager=self.budget_manager, rlm_logger=self.rlm_logger),
@@ -200,14 +197,12 @@ class RLMAgent(CodeAgent):
 
     def _log_action_step(self, memory_step, agent=None):
         """Emit execution_result JSONL event for each orchestrator step."""
-        from smolagents.rlm_logging import _format_usage, _ts
-
         self.rlm_logger.emit(
             "execution_result",
             step=memory_step.step_number,
-            code=memory_step.code_action,
-            output=memory_step.observations,
-            hasError=memory_step.error is not None,
+            code=_truncate(memory_step.code_action),
+            output=_truncate(memory_step.observations),
+            has_error=memory_step.error is not None,
             usage=_format_usage(memory_step.token_usage),
             timestamps={
                 "llm_call_start": _ts(memory_step.timing.start_time),
@@ -217,7 +212,7 @@ class RLMAgent(CodeAgent):
 
     def _log_final_answer(self, memory_step, agent=None):
         """Emit final_result JSONL event."""
-        self.rlm_logger.emit("final_result", result=str(memory_step.output))
+        self.rlm_logger.emit("final_result", result=_truncate(str(memory_step.output)))
 
     def run(self, task: str, context=None, show_metadata: bool = True, **kwargs):
         """Run the RLM agent on a task with optional large context.
@@ -269,9 +264,12 @@ class RLMAgent(CodeAgent):
 
         if self.rlm_logger:
             self.rlm_logger.emit("agent_start", task=task[:500])
+        success = False
         try:
             result = super().run(task=task, additional_args=additional_args, **super_kwargs)
+            success = True
         finally:
             if self.rlm_logger:
-                self.rlm_logger.emit("agent_end")
+                self.rlm_logger.emit("agent_end", success=success)
+                self.rlm_logger.close()
         return result
