@@ -327,13 +327,16 @@ class RLMQueryTool(Tool):
         # interleaving with the parent's output.
         silent_logger = AgentLogger(level=LogLevel.OFF, console=Console(file=StringIO()))
 
+        # Lazy import for logging helpers — used in both callback setup and metrics logging below.
+        if self.rlm_logger:
+            from smolagents.rlm_logging import _format_usage, _truncate, _ts
+
         # If rlm_logger exists, register step callbacks so child orchestrator
         # steps appear in the JSONL log. Without this, only sub-LLM calls from
         # the child's tools are logged — the child's code/observations are invisible.
         child_callbacks = None
         if self.rlm_logger:
             from smolagents.memory import ActionStep, FinalAnswerStep
-            from smolagents.rlm_logging import _format_usage, _truncate, _ts
 
             child_depth = self.depth + 1
             logger = self.rlm_logger
@@ -362,6 +365,11 @@ class RLMQueryTool(Tool):
                 FinalAnswerStep: _log_child_final,
             }
 
+        # Build context metadata so the child LLM knows size/shape upfront
+        # (same as root RLMAgent.run() does — prevents wasting step 1 on len()).
+        from smolagents.rlm import make_variable_info
+        context_info = make_variable_info("context", context)
+
         child = CodeAgent(
             tools=child_tools,
             model=self.model,
@@ -372,13 +380,60 @@ class RLMQueryTool(Tool):
             verbosity_level=LogLevel.OFF,
             logger=silent_logger,
         )
+        call_start = time.time()
         try:
             # Inject context into the child's state dict before run().
             # run() calls send_variables(self.state) which copies it into the
             # executor's namespace — so `context` is available as a Python variable.
             child.state["context"] = context
-            result = child.run(task=task)
-            return str(result) if result is not None else ""
+            run_result = child.run(
+                task=task,
+                additional_args={"variables_info": context_info},
+                return_full_result=True,
+            )
+            call_end = time.time()
+
+            # Extract metrics from RunResult
+            output = str(run_result.output) if run_result.output is not None else ""
+            child_steps = len([s for s in run_result.steps if s.get("code_action")])
+            wall_time = call_end - call_start
+            exhausted = run_result.state == "max_steps_error"
+
+            # Log the rlm_query call with child metrics
+            if self.rlm_logger:
+                self.rlm_logger.emit(
+                    "rlm_query",
+                    depth=self.depth,
+                    child_depth=self.depth + 1,
+                    task=task[:500],
+                    context_chars=len(context),
+                    child_steps=child_steps,
+                    child_max_steps=self.max_child_steps,
+                    exhausted_steps=exhausted,
+                    wall_time_s=round(wall_time, 2),
+                    usage=_format_usage(run_result.token_usage) if hasattr(run_result, 'token_usage') else None,
+                    result_preview=output[:200],
+                )
+
+            # Append metrics summary so the parent LLM sees child performance
+            metrics = f"\n[rlm_query: {child_steps} steps, {wall_time:.1f}s"
+            if exhausted:
+                metrics += ", WARNING: child exhausted max_steps — result may be incomplete"
+            metrics += "]"
+            return output + metrics
+        except Exception:
+            call_end = time.time()
+            if self.rlm_logger:
+                self.rlm_logger.emit(
+                    "rlm_query",
+                    depth=self.depth,
+                    child_depth=self.depth + 1,
+                    task=task[:500],
+                    context_chars=len(context),
+                    wall_time_s=round(call_end - call_start, 2),
+                    error=True,
+                )
+            raise
         finally:
             # CodeAgent.cleanup() releases executor resources (local executor is
             # lightweight, but remote executors hold Docker/e2b handles).

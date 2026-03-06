@@ -733,6 +733,32 @@ class TestAgentLogging:
         agent = RLMAgent(model=model)
         assert agent.rlm_logger is None
 
+    def test_verbose_reasoning_logs_reasoning_field(self, tmp_path):
+        """verbose_reasoning=True adds 'reasoning' field to execution_result events."""
+        path = tmp_path / "reasoning.jsonl"
+        model = FakeOrchestratorModel()
+        agent = RLMAgent(model=model, max_steps=3, log_path=str(path), verbose_reasoning=True)
+        agent.run(task="Count reds", context="Entry 0: red")
+        agent.close()
+
+        events = _read_events(path)
+        exec_events = [e for e in events if e["event_type"] == "execution_result"]
+        assert len(exec_events) > 0
+        # At least one exec event should have a reasoning field
+        assert any("reasoning" in e for e in exec_events)
+
+    def test_no_verbose_reasoning_omits_reasoning_field(self, tmp_path):
+        """verbose_reasoning=False (default) omits 'reasoning' from JSONL."""
+        path = tmp_path / "no_reasoning.jsonl"
+        model = FakeOrchestratorModel()
+        agent = RLMAgent(model=model, max_steps=3, log_path=str(path))
+        agent.run(task="Count reds", context="Entry 0: red")
+        agent.close()
+
+        events = _read_events(path)
+        exec_events = [e for e in events if e["event_type"] == "execution_result"]
+        assert all("reasoning" not in e for e in exec_events)
+
     def test_sub_llm_calls_logged_during_run(self, tmp_path):
         """When agent calls llm_query_batched, sub-LLM events appear in log."""
         path = tmp_path / "sub_calls.jsonl"
@@ -884,13 +910,27 @@ class TestDynamicInstructions:
         """Instructions omit limit section when sub_model_max_chars=None."""
         instructions = _build_rlm_instructions(None)
         assert "Sub-LLM Limits" not in instructions
-        assert "BATCH-CLASSIFY" in instructions  # other rules still present
+        assert "DELEGATE or CLASSIFY" in instructions  # other rules still present
 
     def test_instructions_include_filter_pattern(self):
         """Instructions include the batch-classify pattern."""
         instructions = _build_rlm_instructions(32_000)
-        assert "BATCH-CLASSIFY" in instructions
+        assert "DELEGATE or CLASSIFY" in instructions
         assert "llm_query_batched" in instructions
+
+    def test_verbose_reasoning_off_by_default(self):
+        """verbose_reasoning=False omits reasoning trace instructions."""
+        instructions = _build_rlm_instructions(32_000)
+        assert "[TOOL_CHOICE]" not in instructions
+        assert "[APPROACH]" not in instructions
+
+    def test_verbose_reasoning_injects_trace_tags(self):
+        """verbose_reasoning=True adds structured reasoning tags."""
+        instructions = _build_rlm_instructions(32_000, verbose_reasoning=True)
+        assert "[TOOL_CHOICE]" in instructions
+        assert "[APPROACH]" in instructions
+        assert "[EVIDENCE]" in instructions
+        assert "system prompt rule" in instructions  # asks LLM to cite what triggered choice
 
 
 class TestTokenEstimateInMetadata:
@@ -1050,7 +1090,8 @@ class TestRLMQueryTool:
             model=FakeChildWithLLMQueryModel(), sub_model=sub,
         )
         result = tool.forward("classify the data", "great product")
-        assert result == "classified: positive"
+        assert "classified: positive" in result
+        assert "[rlm_query:" in result  # metrics suffix appended
         assert sub.call_count == 1
 
     def test_max_depth_1_spawns_child_not_flat(self, make_rlm_tool):
@@ -1063,10 +1104,11 @@ class TestRLMQueryTool:
     # --- Error handling ---
 
     def test_child_returns_none_on_max_steps(self, make_rlm_tool):
-        """Child that never calls final_answer → tool returns a string, no crash."""
+        """Child that never calls final_answer → tool returns metrics with exhausted warning."""
         tool = make_rlm_tool(depth=0, max_depth=2, model=FakeNeverFinishModel(), max_child_steps=2)
         result = tool.forward("do something", "data")
         assert isinstance(result, str)
+        assert "exhausted max_steps" in result
 
     def test_child_model_exception_propagates(self, make_rlm_tool):
         """Child orchestrator model failure propagates as AgentGenerationError."""
@@ -1212,8 +1254,8 @@ class FakeDepth2OrchestratorModel(Model):
 
     def generate(self, messages, stop_sequences=None, **kwargs):
         text = str(messages)
-        # Depth 0: the system prompt mentions rlm_query tool
-        if "rlm_query" in text and "processed:" not in text:
+        # Depth 0 root: hasn't seen "count chars" task yet (that's the child task)
+        if "count chars" not in text and "processed:" not in text:
             return ChatMessage(
                 role=MessageRole.ASSISTANT,
                 content='<code>\nresult = rlm_query("count chars", context)\nfinal_answer("root got: " + result)\n</code>',
@@ -1268,3 +1310,35 @@ class TestDepth2EndToEnd:
         # Child execution_result events should exist
         child_exec = [e for e in events if e["event_type"] == "execution_result" and e.get("depth", 0) > 0]
         assert len(child_exec) > 0, "Child orchestrator steps should be logged"
+
+    def test_rlm_query_event_logged_with_metrics(self, tmp_path):
+        """rlm_query call itself is logged with timing, steps, and context size."""
+        path = tmp_path / "rlm_metrics.jsonl"
+        model = FakeDepth2OrchestratorModel()
+        agent = RLMAgent(
+            model=model, recursive=True, max_depth=2,
+            max_steps=3, max_child_steps=5,
+            log_path=str(path),
+        )
+        agent.run(task="How long is this?", context="hello world")
+        agent.close()
+
+        events = _read_events(path)
+        rlm_events = [e for e in events if e["event_type"] == "rlm_query"]
+        assert len(rlm_events) >= 1, "Should have at least one rlm_query event"
+        ev = rlm_events[0]
+        assert ev["context_chars"] == len("hello world")
+        assert ev["child_steps"] >= 1
+        assert ev["wall_time_s"] >= 0
+        assert "exhausted_steps" in ev
+
+    def test_child_result_includes_metrics_suffix(self):
+        """rlm_query result string includes [rlm_query: N steps, Xs] suffix."""
+        model = FakeDepth2OrchestratorModel()
+        agent = RLMAgent(
+            model=model, recursive=True, max_depth=2,
+            max_steps=3, max_child_steps=5,
+        )
+        result = str(agent.run(task="How long is this?", context="hello world"))
+        assert "[rlm_query:" in result
+        assert "steps" in result

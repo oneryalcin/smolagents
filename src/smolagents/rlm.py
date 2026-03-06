@@ -75,7 +75,25 @@ def make_variable_info(name: str, value: Any, preview_chars: int = 1000) -> str:
 # RLM instructions injected into system prompt
 # ---------------------------------------------------------------------------
 
-def _build_rlm_instructions(sub_model_max_chars: int | None, recursive: bool = False) -> str:
+_REASONING_TRACE_INSTRUCTIONS = """
+### Reasoning Trace (verbose_reasoning mode)
+Before each code block, structure your Thought section with these tags:
+
+**[APPROACH]** — What is your plan for this step? What sub-question are you tackling?
+**[TOOL_CHOICE]** — Which tool(s) will you use and WHY?
+  - State what triggered your choice: a system prompt rule, a tool description, data you observed, or output from a prior step.
+  - If you considered alternatives, say why you rejected them.
+  - Examples:
+    "Using llm_query (not rlm_query) — system prompt says 'use llm_query for simple single-shot classification'."
+    "Using rlm_query — data has 96 docs, too complex for one LLM call. System prompt says 'use rlm_query for sub-investigations'."
+    "Python only — system prompt rule 'Don't waste LLM calls on counting'."
+**[EVIDENCE]** — What evidence from previous steps or data inspection supports this choice?
+
+Keep each tag to 1-2 sentences. This is for debugging, not an essay.
+"""
+
+
+def _build_rlm_instructions(sub_model_max_chars: int | None, recursive: bool = False, verbose_reasoning: bool = False) -> str:
     """Build RLM instructions with optional sub-model limit awareness."""
     limit_section = ""
     if sub_model_max_chars:
@@ -90,12 +108,23 @@ def _build_rlm_instructions(sub_model_max_chars: int | None, recursive: bool = F
     recursive_section = ""
     if recursive:
         recursive_section = """
-### Recursive Sub-Tasks
+### Recursive Sub-Tasks (`rlm_query`)
 - `rlm_query(task, context)` — delegate a sub-task to a child agent with its own Python REPL
 - The child can peek, grep, call llm_query — just like you
-- Use when a sub-task needs code execution, not just an LLM call
-- Example: `result = rlm_query("Count positive reviews", big_chunk)`
-- Do NOT use rlm_query for simple classification — use llm_query instead (cheaper)
+- **Use `rlm_query` when a sub-task needs multiple steps**: filtering, then LLM analysis, then aggregation
+- **Use `rlm_query` for sub-investigations**: "find all docs about X and extract Y from them"
+- Use `llm_query` (not `rlm_query`) for simple single-shot classification — it's cheaper
+- Example — partition and delegate:
+  ```python
+  # Split docs into chunks, delegate analysis of each chunk to a child agent
+  docs = context.split("=== Document")
+  chunk_size = len(docs) // 3
+  chunks = [docs[i:i+chunk_size] for i in range(0, len(docs), chunk_size)]
+  findings = []
+  for chunk in chunks:
+      result = rlm_query("Find documents mentioning the target criteria and extract key facts", "=== Document".join(chunk))
+      findings.append(result)
+  ```
 """
 
     return f"""
@@ -120,7 +149,9 @@ The data typically has no explicit labels — YOU must classify items using the 
    print(context[:2000])
    ```
 
-2. **USE PYTHON FIRST** — string ops, regex, counting are free and instant:
+2. **DECOMPOSE** — break the task into sub-questions. If the task has multiple constraints or requires combining evidence from different parts of the data, identify each sub-question explicitly before writing code.
+
+3. **USE PYTHON FIRST** — string ops, regex, counting are free and instant:
    ```python
    import re
    from collections import Counter
@@ -128,21 +159,19 @@ The data typically has no explicit labels — YOU must classify items using the 
    dates = re.findall(r'Date: (\\w+ \\d+, \\d{{4}})', context)
    ```
 
-3. **BATCH-CLASSIFY with sub-LLM** — when semantic judgment is needed, batch 20-50 items per prompt:
+4. **DELEGATE or CLASSIFY** — choose the right tool for each sub-question:
+   - `llm_query` / `llm_query_batched` — single-shot semantic analysis (classification, extraction, summarization)
+   - `rlm_query` — multi-step sub-investigations where the child needs to explore, filter, and reason over a chunk of data
    ```python
-   # Filter relevant items with Python (free)
-   items = [l for l in context.splitlines() if 'User: 12345' in l]
-   # Batch into chunks of ~40 items per prompt
-   chunk_size = 40
-   chunks = [items[i:i+chunk_size] for i in range(0, len(items), chunk_size)]
-   prompts = []
-   for chunk in chunks:
-       numbered = "\\n".join(f"{{j+1}}. {{item}}" for j, item in enumerate(chunk))
-       prompts.append(f"Classify each item as positive or negative. Return one label per line, in order.\\n{{numbered}}")
-   results = llm_query_batched(prompts)
+   # Single-shot: classify a document
+   label = llm_query(f"Is this document about topic X? Answer yes/no.\\n{{doc_text}}")
+   # Multi-step: investigate a sub-question across many documents
+   result = rlm_query("Find which country had 250K-300K assaults in 2003", relevant_docs)
    ```
 
-4. **PARSE CAREFULLY** — when counting labels, avoid substring collisions:
+5. **CROSS-REFERENCE** — combine findings from different sub-questions. The answer often requires chaining: result A narrows the search space for question B.
+
+6. **PARSE CAREFULLY** — when counting labels, avoid substring collisions:
    ```python
    # WRONG: 'positive' in 'not positive' → True
    # RIGHT: check exact word or exclude negations
@@ -154,7 +183,7 @@ The data typically has no explicit labels — YOU must classify items using the 
            labels.append('correct')
    ```
 
-5. **VERIFY** — print results and sanity-check before final_answer.
+7. **VERIFY** — print results and sanity-check before final_answer.
 
 ### Batching Rules
 - **NEVER** send 1 item per LLM call when you have >10 items
@@ -167,7 +196,7 @@ The data typically has no explicit labels — YOU must classify items using the 
 - Filtering → list comprehensions
 - Sorting/grouping → `sorted()`, `itertools.groupby()`
 
-**IMPORTANT: Every response MUST contain a `<code>` block. Never respond with only text.**
+{"" if not verbose_reasoning else _REASONING_TRACE_INSTRUCTIONS}**IMPORTANT: Every response MUST contain a `<code>` block. Never respond with only text.**
 """
 
 
@@ -198,6 +227,10 @@ class RLMAgent(CodeAgent):
             (default), the root can spawn a child, and the child can spawn
             a leaf (flat LLM only). Must be >= 1.
         max_child_steps: Maximum CodeAgent steps for each child agent.
+        verbose_reasoning: When True, injects instructions asking the LLM to
+            emit structured [APPROACH], [TOOL_CHOICE], [EVIDENCE] tags in its
+            Thought section. The full reasoning text is logged to JSONL for
+            prompt engineering and debugging. Default False.
         **kwargs: Passed to CodeAgent (max_steps, planning_interval, etc.)
     """
 
@@ -215,6 +248,7 @@ class RLMAgent(CodeAgent):
         recursive: bool = False,
         max_depth: int = 2,
         max_child_steps: int = 10,
+        verbose_reasoning: bool = False,
         **kwargs,
     ):
         sub_model = sub_model or model
@@ -256,7 +290,10 @@ class RLMAgent(CodeAgent):
 
         # Inject RLM instructions into the system prompt via additional instructions
         base_instructions = kwargs.pop("instructions", "") or ""
-        kwargs["instructions"] = base_instructions + _build_rlm_instructions(sub_model_max_chars, recursive=recursive)
+        self.verbose_reasoning = verbose_reasoning
+        kwargs["instructions"] = base_instructions + _build_rlm_instructions(
+            sub_model_max_chars, recursive=recursive, verbose_reasoning=verbose_reasoning,
+        )
 
         super().__init__(
             tools=all_tools,
@@ -305,6 +342,14 @@ class RLMAgent(CodeAgent):
 
     def _log_action_step(self, memory_step, agent=None):
         """Emit execution_result JSONL event for each orchestrator step."""
+        extra = {}
+        if self.verbose_reasoning and memory_step.model_output:
+            # Log the full Thought text (before <code>) for prompt engineering debug.
+            # model_output contains "Thought: ... <code>...</code>" — we want the part before <code>.
+            raw = memory_step.model_output if isinstance(memory_step.model_output, str) else str(memory_step.model_output)
+            code_start = raw.find("<code>")
+            reasoning = raw[:code_start].strip() if code_start > 0 else raw.strip()
+            extra["reasoning"] = _truncate(reasoning, max_len=4000)
         self.rlm_logger.emit(
             "execution_result",
             step=memory_step.step_number,
@@ -316,6 +361,7 @@ class RLMAgent(CodeAgent):
                 "llm_call_start": _ts(memory_step.timing.start_time),
                 "execution_end": _ts(memory_step.timing.end_time),
             },
+            **extra,
         )
 
     def _log_final_answer(self, memory_step, agent=None):
