@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from smolagents.agents import CodeAgent
-from smolagents.memory import ActionStep, FinalAnswerStep
+from smolagents.memory import ActionStep, ChatMessage, FinalAnswerStep, MessageRole
 from smolagents.models import Model
 from smolagents.monitoring import LogLevel
 from smolagents.rlm_logging import RLMLogger, _format_usage, _truncate, _ts
@@ -178,6 +178,8 @@ class RLMAgent(CodeAgent):
             large inputs. Default 64000 (~16K tokens). Set None to disable.
         max_output_length: Truncation limit for code output. Default 3000.
         max_workers: Max parallel threads for llm_query_batched. Default 8.
+        prompt_cache: Inject cache_control on system prompt for Anthropic models.
+            Reduces input token cost by ~90% on multi-step runs. Default True.
         tools: Additional tools beyond the RLM defaults.
         **kwargs: Passed to CodeAgent (max_steps, planning_interval, etc.)
     """
@@ -191,10 +193,12 @@ class RLMAgent(CodeAgent):
         sub_model_max_chars: int | None = 64_000,
         max_output_length: int = 3000,
         max_workers: int = 8,
+        prompt_cache: bool = True,
         tools: list | None = None,
         **kwargs,
     ):
         sub_model = sub_model or model
+        self.prompt_cache = prompt_cache
         self.budget_manager = BudgetManager(budget) if budget else None
 
         self.rlm_logger = RLMLogger(log_path) if log_path else None
@@ -234,6 +238,24 @@ class RLMAgent(CodeAgent):
         if self.rlm_logger:
             self.step_callbacks.register(ActionStep, self._log_action_step)
             self.step_callbacks.register(FinalAnswerStep, self._log_final_answer)
+
+    def write_memory_to_messages(self, summary_mode=False):
+        """Override to inject cache_control on system prompt for Anthropic prompt caching.
+
+        Adds {"cache_control": {"type": "ephemeral"}} to the system message content block.
+        This tells Anthropic to cache the static prefix (system prompt + tool definitions),
+        reducing input token cost by ~90% on subsequent steps. Non-Anthropic providers
+        ignore the extra key. See: https://github.com/huggingface/smolagents/issues/2054
+        """
+        messages = super().write_memory_to_messages(summary_mode=summary_mode)
+        if self.prompt_cache and messages and messages[0].role == MessageRole.SYSTEM:
+            content = messages[0].content
+            if isinstance(content, list) and content:
+                # Add cache_control to the last content block in system message
+                last_block = content[-1]
+                if isinstance(last_block, dict) and "cache_control" not in last_block:
+                    last_block["cache_control"] = {"type": "ephemeral"}
+        return messages
 
     def _budget_callback(self, memory_step, agent=None):
         """Append budget summary to step observations so the LLM sees remaining budget."""
