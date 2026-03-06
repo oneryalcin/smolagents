@@ -411,7 +411,7 @@ class RLMQueryTool(Tool):
                     child_max_steps=self.max_child_steps,
                     exhausted_steps=exhausted,
                     wall_time_s=round(wall_time, 2),
-                    usage=_format_usage(run_result.token_usage) if hasattr(run_result, 'token_usage') else None,
+                    usage=_format_usage(run_result.token_usage),
                     result_preview=output[:200],
                 )
 
@@ -430,6 +430,7 @@ class RLMQueryTool(Tool):
                     child_depth=self.depth + 1,
                     task=task[:500],
                     context_chars=len(context),
+                    child_max_steps=self.max_child_steps,
                     wall_time_s=round(call_end - call_start, 2),
                     error=True,
                 )

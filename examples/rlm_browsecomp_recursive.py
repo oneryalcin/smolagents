@@ -89,14 +89,17 @@ print(f"\n--- Trace Summary ({LOG_PATH}) ---")
 with open(LOG_PATH) as f:
     events = [json.loads(line) for line in f]
 
-rlm_calls = sum(1 for e in events if e["event_type"] == "execution_result"
-                and e.get("code") and "rlm_query" in e.get("code", ""))
+rlm_calls = [e for e in events if e["event_type"] == "rlm_query"]
 llm_calls = sum(1 for e in events if e["event_type"] == "llm_call")
 child_steps = sum(1 for e in events if e["event_type"] == "execution_result" and e.get("depth", 0) > 0)
 root_steps = sum(1 for e in events if e["event_type"] == "execution_result" and e.get("depth", 0) == 0)
 
 print(f"  Root steps: {root_steps}")
 print(f"  Child steps: {child_steps}")
-print(f"  rlm_query calls (in code): {rlm_calls}")
+print(f"  rlm_query calls: {len(rlm_calls)}")
+for i, rc in enumerate(rlm_calls):
+    exhausted = " EXHAUSTED" if rc.get("exhausted_steps") else ""
+    print(f"    [{i}] {rc.get('child_steps', '?')}/{rc.get('child_max_steps', '?')} steps, "
+          f"{rc.get('wall_time_s', '?')}s, {rc.get('context_chars', '?'):,} chars{exhausted}")
 print(f"  Sub-LLM calls: {llm_calls}")
 print(f"  Total events: {len(events)}")

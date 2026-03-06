@@ -113,6 +113,7 @@ def _build_rlm_instructions(sub_model_max_chars: int | None, recursive: bool = F
 - The child can peek, grep, call llm_query — just like you
 - **Use `rlm_query` when a sub-task needs multiple steps**: filtering, then LLM analysis, then aggregation
 - **Use `rlm_query` for sub-investigations**: "find all docs about X and extract Y from them"
+- **Always filter context before passing to rlm_query** — do NOT pass the full raw context. Use Python to extract the relevant subset first.
 - Use `llm_query` (not `rlm_query`) for simple single-shot classification — it's cheaper
 - Example — partition and delegate:
   ```python
@@ -348,7 +349,7 @@ class RLMAgent(CodeAgent):
             # model_output contains "Thought: ... <code>...</code>" — we want the part before <code>.
             raw = memory_step.model_output if isinstance(memory_step.model_output, str) else str(memory_step.model_output)
             code_start = raw.find("<code>")
-            reasoning = raw[:code_start].strip() if code_start > 0 else raw.strip()
+            reasoning = raw[:code_start].strip() if code_start != -1 else raw.strip()
             extra["reasoning"] = _truncate(reasoning, max_len=4000)
         self.rlm_logger.emit(
             "execution_result",
