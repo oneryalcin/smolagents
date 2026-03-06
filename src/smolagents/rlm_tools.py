@@ -228,3 +228,197 @@ class LLMQueryBatchedTool(Tool):
                 raise
 
         return [results[i] for i in range(n)]
+
+
+class RLMQueryTool(Tool):
+    """Delegate a sub-task to a child RLM agent that has its own Python REPL.
+
+    At each depth level, the child gets llm_query + llm_query_batched tools.
+    If not at max depth, it also gets its own rlm_query for further recursion.
+
+    Depth semantics (with max_depth=2):
+        depth=0  →  spawns child CodeAgent, child gets rlm_query(depth=1)
+        depth=1  →  spawns child CodeAgent, child has NO rlm_query (leaf agent)
+        depth=2  →  leaf: falls back to flat _execute_sub_llm (no REPL)
+
+    The BudgetManager is shared across all depths — one global cap on LLM calls.
+
+    Note on context vs max_prompt_chars:
+        The ``context`` argument is injected into the child's state as a Python
+        variable — it does NOT go into an LLM prompt directly. max_prompt_chars
+        guards llm_query prompts, not rlm_query context. The child is expected
+        to chunk large context via code before calling llm_query.
+
+    Note on concurrency:
+        Each rlm_query call blocks until the child finishes (synchronous).
+        A child's llm_query_batched uses up to max_workers threads. Thread
+        multiplication (N children × M workers) is NOT possible because the
+        LocalPythonExecutor's AST interpreter blocks ``concurrent.futures``
+        imports — generated code cannot parallelize rlm_query calls. The
+        maximum concurrent threads at any point is max_workers (from a single
+        llm_query_batched call), and the shared BudgetManager caps total calls.
+    """
+
+    name = "rlm_query"
+    description = (
+        "Delegate a sub-task to a child RLM agent with its own Python REPL. "
+        "The child can peek, grep, and call llm_query on its input. "
+        "Use for complex sub-tasks that need code execution, not just a single LLM call. "
+        "Pass the data as part of the context string — the child sees it as a variable."
+    )
+    inputs = {
+        "task": {"type": "string", "description": "The sub-task instruction."},
+        "context": {"type": "string", "description": "The data for the child to process."},
+    }
+    output_type = "string"
+
+    def __init__(
+        self,
+        model: Model,
+        sub_model: Model,
+        depth: int,
+        max_depth: int,
+        budget_manager: BudgetManager | None,
+        rlm_logger,
+        max_prompt_chars: int | None,
+        max_child_steps: int,
+        max_workers: int,
+        additional_authorized_imports: list[str] | None = None,
+        **kwargs,
+    ):
+        if max_depth < 1:
+            raise ValueError(f"max_depth must be >= 1, got {max_depth}")
+        super().__init__(**kwargs)
+        self.model = model          # orchestrator model (writes code)
+        self.sub_model = sub_model  # sub-LLM model (flat calls)
+        self.depth = depth
+        self.max_depth = max_depth
+        self.budget_manager = budget_manager
+        self.rlm_logger = rlm_logger
+        self.max_prompt_chars = max_prompt_chars
+        self.max_child_steps = max_child_steps
+        self.max_workers = max_workers
+        self.additional_authorized_imports = additional_authorized_imports or []
+
+    def forward(self, task: str, context: str) -> str:
+        # Leaf depth: no REPL, just a flat LLM call with task + context as prompt
+        if self.depth >= self.max_depth:
+            return _execute_sub_llm(
+                self.sub_model, f"{task}\n\n{context}",
+                self.budget_manager, self.rlm_logger, self.max_prompt_chars,
+            )
+
+        # --- Lazy imports: only loaded when we actually spawn a child agent ---
+        # Avoids circular dep (rlm_tools → agents → rlm) and keeps module-level
+        # imports clean — these are only needed for the recursive path.
+        from io import StringIO
+
+        from rich.console import Console
+
+        from smolagents.agents import CodeAgent
+        from smolagents.monitoring import AgentLogger, LogLevel
+        from smolagents.rlm import _build_rlm_instructions
+
+        child_tools = self._build_child_tools()
+        child_has_rlm = self.depth + 1 < self.max_depth
+        instructions = _build_rlm_instructions(self.max_prompt_chars, recursive=child_has_rlm)
+
+        # Suppress all rich.Live / console output from the child to avoid
+        # interleaving with the parent's output.
+        silent_logger = AgentLogger(level=LogLevel.OFF, console=Console(file=StringIO()))
+
+        # If rlm_logger exists, register step callbacks so child orchestrator
+        # steps appear in the JSONL log. Without this, only sub-LLM calls from
+        # the child's tools are logged — the child's code/observations are invisible.
+        child_callbacks = None
+        if self.rlm_logger:
+            from smolagents.memory import ActionStep, FinalAnswerStep
+            from smolagents.rlm_logging import _format_usage, _truncate, _ts
+
+            child_depth = self.depth + 1
+            logger = self.rlm_logger
+
+            def _log_child_step(memory_step, agent=None):
+                logger.emit(
+                    "execution_result",
+                    depth=child_depth,
+                    step=memory_step.step_number,
+                    code=_truncate(memory_step.code_action),
+                    output=_truncate(memory_step.observations),
+                    has_error=memory_step.error is not None,
+                    usage=_format_usage(memory_step.token_usage),
+                    timestamps={
+                        "llm_call_start": _ts(memory_step.timing.start_time),
+                        "execution_end": _ts(memory_step.timing.end_time),
+                    },
+                )
+
+            def _log_child_final(memory_step, agent=None):
+                logger.emit("final_result", depth=child_depth,
+                            result=_truncate(str(memory_step.output)))
+
+            child_callbacks = {
+                ActionStep: _log_child_step,
+                FinalAnswerStep: _log_child_final,
+            }
+
+        child = CodeAgent(
+            tools=child_tools,
+            model=self.model,
+            instructions=instructions,
+            max_steps=self.max_child_steps,
+            additional_authorized_imports=self.additional_authorized_imports,
+            step_callbacks=child_callbacks,
+            verbosity_level=LogLevel.OFF,
+            logger=silent_logger,
+        )
+        try:
+            # Inject context into the child's state dict before run().
+            # run() calls send_variables(self.state) which copies it into the
+            # executor's namespace — so `context` is available as a Python variable.
+            child.state["context"] = context
+            result = child.run(task=task)
+            return str(result) if result is not None else ""
+        finally:
+            # CodeAgent.cleanup() releases executor resources (local executor is
+            # lightweight, but remote executors hold Docker/e2b handles).
+            child.cleanup()
+
+    def _build_child_tools(self):
+        """Build the tool set for a child agent at depth+1.
+
+        Every child gets llm_query + llm_query_batched.
+        Non-leaf children also get rlm_query for further recursion.
+        """
+        tools = [
+            LLMQueryTool(
+                model=self.sub_model,
+                budget_manager=self.budget_manager,
+                rlm_logger=self.rlm_logger,
+                max_prompt_chars=self.max_prompt_chars,
+            ),
+            LLMQueryBatchedTool(
+                model=self.sub_model,
+                max_workers=self.max_workers,
+                budget_manager=self.budget_manager,
+                rlm_logger=self.rlm_logger,
+                max_prompt_chars=self.max_prompt_chars,
+            ),
+        ]
+
+        next_depth = self.depth + 1
+        if next_depth < self.max_depth:
+            tools.append(RLMQueryTool(
+                model=self.model,
+                sub_model=self.sub_model,
+                depth=next_depth,
+                max_depth=self.max_depth,
+                budget_manager=self.budget_manager,
+                rlm_logger=self.rlm_logger,
+                max_prompt_chars=self.max_prompt_chars,
+                max_child_steps=self.max_child_steps,
+                max_workers=self.max_workers,
+                additional_authorized_imports=self.additional_authorized_imports,
+            ))
+
+        return tools

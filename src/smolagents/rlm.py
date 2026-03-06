@@ -27,7 +27,7 @@ from smolagents.memory import ActionStep, ChatMessage, FinalAnswerStep, MessageR
 from smolagents.models import Model
 from smolagents.monitoring import LogLevel
 from smolagents.rlm_logging import RLMLogger, _format_usage, _truncate, _ts
-from smolagents.rlm_tools import Budget, BudgetManager, LLMQueryBatchedTool, LLMQueryTool
+from smolagents.rlm_tools import Budget, BudgetManager, LLMQueryBatchedTool, LLMQueryTool, RLMQueryTool
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +75,7 @@ def make_variable_info(name: str, value: Any, preview_chars: int = 1000) -> str:
 # RLM instructions injected into system prompt
 # ---------------------------------------------------------------------------
 
-def _build_rlm_instructions(sub_model_max_chars: int | None) -> str:
+def _build_rlm_instructions(sub_model_max_chars: int | None, recursive: bool = False) -> str:
     """Build RLM instructions with optional sub-model limit awareness."""
     limit_section = ""
     if sub_model_max_chars:
@@ -87,6 +87,17 @@ def _build_rlm_instructions(sub_model_max_chars: int | None) -> str:
 - NEVER pass raw `context` to llm_query when context is larger than this limit
 """
 
+    recursive_section = ""
+    if recursive:
+        recursive_section = """
+### Recursive Sub-Tasks
+- `rlm_query(task, context)` — delegate a sub-task to a child agent with its own Python REPL
+- The child can peek, grep, call llm_query — just like you
+- Use when a sub-task needs code execution, not just an LLM call
+- Example: `result = rlm_query("Count positive reviews", big_chunk)`
+- Do NOT use rlm_query for simple classification — use llm_query instead (cheaper)
+"""
+
     return f"""
 ## RLM: How to Handle Large Context
 
@@ -96,7 +107,7 @@ You MUST explore it and use your sub-LLM tools to classify/analyze items when ne
 **Tools:**
 - `llm_query(prompt)` — single sub-LLM call for semantic analysis
 - `llm_query_batched(prompts)` — parallel sub-LLM calls (list in, list out); much faster than a loop
-{limit_section}
+{limit_section}{recursive_section}
 ### Critical: Explore Before Answering
 Your first step MUST be to inspect the context structure and plan your approach.
 Do NOT jump to a final answer without first understanding the data format and size.
@@ -181,6 +192,12 @@ class RLMAgent(CodeAgent):
         prompt_cache: Inject cache_control on system prompt for Anthropic models.
             Reduces input token cost by ~90% on multi-step runs. Default True.
         tools: Additional tools beyond the RLM defaults.
+        recursive: Enable rlm_query tool for spawning child RLM agents with
+            their own REPL. Each child can peek, grep, and call llm_query.
+        max_depth: Maximum recursion depth for rlm_query. With max_depth=2
+            (default), the root can spawn a child, and the child can spawn
+            a leaf (flat LLM only). Must be >= 1.
+        max_child_steps: Maximum CodeAgent steps for each child agent.
         **kwargs: Passed to CodeAgent (max_steps, planning_interval, etc.)
     """
 
@@ -195,6 +212,9 @@ class RLMAgent(CodeAgent):
         max_workers: int = 8,
         prompt_cache: bool = True,
         tools: list | None = None,
+        recursive: bool = False,
+        max_depth: int = 2,
+        max_child_steps: int = 10,
         **kwargs,
     ):
         sub_model = sub_model or model
@@ -214,11 +234,29 @@ class RLMAgent(CodeAgent):
                 max_prompt_chars=sub_model_max_chars,
             ),
         ]
+
+        if recursive:
+            # Capture parent's authorized imports so children inherit them.
+            # The value also flows to CodeAgent via **kwargs — we just read it here.
+            parent_imports = kwargs.get("additional_authorized_imports")
+            rlm_tools.append(RLMQueryTool(
+                model=model,
+                sub_model=sub_model,
+                depth=0,
+                max_depth=max_depth,
+                budget_manager=self.budget_manager,
+                rlm_logger=self.rlm_logger,
+                max_prompt_chars=sub_model_max_chars,
+                max_child_steps=max_child_steps,
+                max_workers=max_workers,
+                additional_authorized_imports=parent_imports,
+            ))
+
         all_tools = rlm_tools + (tools or [])
 
         # Inject RLM instructions into the system prompt via additional instructions
         base_instructions = kwargs.pop("instructions", "") or ""
-        kwargs["instructions"] = base_instructions + _build_rlm_instructions(sub_model_max_chars)
+        kwargs["instructions"] = base_instructions + _build_rlm_instructions(sub_model_max_chars, recursive=recursive)
 
         super().__init__(
             tools=all_tools,

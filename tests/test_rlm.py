@@ -18,6 +18,7 @@ from smolagents.rlm_tools import (
     BudgetManager,
     LLMQueryBatchedTool,
     LLMQueryTool,
+    RLMQueryTool,
     _execute_sub_llm,
 )
 
@@ -905,3 +906,365 @@ class TestTokenEstimateInMetadata:
         """Token estimate works for small strings too."""
         info = make_variable_info("data", "hello world")
         assert "~2 tokens" in info
+
+
+# ---------------------------------------------------------------------------
+# RLMQueryTool
+# ---------------------------------------------------------------------------
+
+
+class FakeChildOrchestratorModel(Model):
+    """Orchestrator for child agent — reads context, returns length."""
+
+    def generate(self, messages, stop_sequences=None, **kwargs):
+        text = str(messages)
+        if "Length:" in text:
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content='<code>\nfinal_answer(f"processed: {len(context)} chars")\n</code>',
+                token_usage=TokenUsage(input_tokens=30, output_tokens=10),
+            )
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content='<code>\nprint(f"Length: {len(context):,} chars")\n</code>',
+            token_usage=TokenUsage(input_tokens=50, output_tokens=15),
+        )
+
+
+class FakeChildWithLLMQueryModel(Model):
+    """Orchestrator that makes the child call llm_query on its context."""
+
+    def generate(self, messages, stop_sequences=None, **kwargs):
+        text = str(messages)
+        if "result:" in text:
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content='<code>\nfinal_answer(result)\n</code>',
+                token_usage=TokenUsage(input_tokens=30, output_tokens=10),
+            )
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content='<code>\nresult = llm_query("classify: " + context[:50])\nprint("result:", result)\n</code>',
+            token_usage=TokenUsage(input_tokens=50, output_tokens=15),
+        )
+
+
+class FakeNeverFinishModel(Model):
+    """Orchestrator that never calls final_answer — always prints."""
+
+    def generate(self, messages, stop_sequences=None, **kwargs):
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content='<code>\nprint("still thinking...")\n</code>',
+            token_usage=TokenUsage(input_tokens=20, output_tokens=10),
+        )
+
+
+@pytest.fixture
+def make_rlm_tool():
+    """Factory fixture for building RLMQueryTool with sensible defaults."""
+    def _make(depth=0, max_depth=2, model=None, sub_model=None,
+              budget_manager=None, max_child_steps=5, max_workers=4):
+        return RLMQueryTool(
+            model=model or FakeSubModel(),
+            sub_model=sub_model or FakeSubModel(),
+            depth=depth, max_depth=max_depth,
+            budget_manager=budget_manager, rlm_logger=None,
+            max_prompt_chars=None, max_child_steps=max_child_steps,
+            max_workers=max_workers,
+        )
+    return _make
+
+
+class TestRLMQueryTool:
+    """Tests for RLMQueryTool: depth tracking, leaf fallback, child spawning."""
+
+    # --- Construction ---
+
+    @pytest.mark.parametrize("bad_depth", [0, -1, -100])
+    def test_invalid_max_depth_raises(self, make_rlm_tool, bad_depth):
+        """max_depth < 1 is invalid."""
+        with pytest.raises(ValueError, match="max_depth must be >= 1"):
+            make_rlm_tool(max_depth=bad_depth)
+
+    # --- Leaf fallback ---
+
+    def test_leaf_depth_falls_back_to_flat_llm(self, make_rlm_tool):
+        """At depth >= max_depth, rlm_query degrades to flat llm_query."""
+        sub = FakeSubModel(response="flat answer")
+        tool = make_rlm_tool(depth=2, max_depth=2, sub_model=sub)
+        result = tool.forward("summarize", "some data")
+        assert result == "flat answer"
+        assert sub.call_count == 1
+
+    # --- Child tool composition ---
+
+    @pytest.mark.parametrize("depth, max_depth, expect_rlm", [
+        (0, 2, True),   # child at depth 1 < max_depth 2 → gets rlm_query
+        (0, 3, True),   # child at depth 1 < max_depth 3 → gets rlm_query
+        (1, 2, False),  # child at depth 2 = max_depth 2 → leaf, no rlm_query
+        (0, 1, False),  # child at depth 1 = max_depth 1 → leaf, no rlm_query
+        (1, 3, True),   # child at depth 2 < max_depth 3 → gets rlm_query
+    ])
+    def test_child_tools_rlm_presence(self, make_rlm_tool, depth, max_depth, expect_rlm):
+        """Child gets rlm_query only when next depth < max_depth."""
+        tool = make_rlm_tool(depth=depth, max_depth=max_depth)
+        child_tools = tool._build_child_tools()
+        names = [t.name for t in child_tools]
+        assert ("rlm_query" in names) == expect_rlm
+        # Every child always gets the flat tools
+        assert "llm_query" in names
+        assert "llm_query_batched" in names
+
+    def test_child_rlm_depth_increments(self, make_rlm_tool):
+        """Child's rlm_query tool has depth = parent depth + 1."""
+        tool = make_rlm_tool(depth=0, max_depth=3)
+        child_tools = tool._build_child_tools()
+        child_rlm = next(t for t in child_tools if t.name == "rlm_query")
+        assert child_rlm.depth == 1
+
+    # --- Budget sharing ---
+
+    def test_shared_budget_across_depths(self, make_rlm_tool):
+        """Budget manager is shared — child flat calls count against parent budget."""
+        bm = BudgetManager(Budget(max_llm_calls=1))
+        sub = FakeSubModel(response="done")
+        tool = make_rlm_tool(depth=2, max_depth=2, sub_model=sub, budget_manager=bm)
+        tool.forward("task", "ctx")
+        with pytest.raises(BudgetExceededError):
+            bm.pre_call_check()
+
+    # --- Child agent execution ---
+
+    def test_spawns_child_agent_with_context(self, make_rlm_tool):
+        """Non-leaf depth spawns a real child CodeAgent that sees context."""
+        tool = make_rlm_tool(depth=0, max_depth=2, model=FakeChildOrchestratorModel())
+        result = tool.forward("How long is the context?", "hello world")
+        assert "11 chars" in result
+
+    def test_child_calls_llm_query(self, make_rlm_tool):
+        """Child agent can call llm_query — verifies full tool wiring at runtime."""
+        sub = FakeSubModel(response="classified: positive")
+        tool = make_rlm_tool(
+            depth=0, max_depth=2,
+            model=FakeChildWithLLMQueryModel(), sub_model=sub,
+        )
+        result = tool.forward("classify the data", "great product")
+        assert result == "classified: positive"
+        assert sub.call_count == 1
+
+    def test_max_depth_1_spawns_child_not_flat(self, make_rlm_tool):
+        """depth=0, max_depth=1: spawns a real child (not flat). The paper's 'depth 1' case."""
+        tool = make_rlm_tool(depth=0, max_depth=1, model=FakeChildOrchestratorModel())
+        result = tool.forward("How long?", "test data")
+        # If it fell back to flat, we'd get sub_model's canned response, not "9 chars"
+        assert "9 chars" in result
+
+    # --- Error handling ---
+
+    def test_child_returns_none_on_max_steps(self, make_rlm_tool):
+        """Child that never calls final_answer → tool returns a string, no crash."""
+        tool = make_rlm_tool(depth=0, max_depth=2, model=FakeNeverFinishModel(), max_child_steps=2)
+        result = tool.forward("do something", "data")
+        assert isinstance(result, str)
+
+    def test_child_model_exception_propagates(self, make_rlm_tool):
+        """Child orchestrator model failure propagates as AgentGenerationError."""
+        from smolagents.utils import AgentGenerationError
+
+        tool = make_rlm_tool(depth=0, max_depth=2, model=FakeFailingModel())
+        with pytest.raises(AgentGenerationError, match="API unavailable"):
+            tool.forward("task", "data")
+
+    def test_budget_exceeded_in_child_llm_query(self, make_rlm_tool):
+        """Budget exhaustion inside a child's llm_query is handled gracefully.
+
+        The child's REPL catches the BudgetExceededError, shows it to the
+        orchestrator, which hits max_steps. Parent gets a string, not a crash.
+        """
+        bm = BudgetManager(Budget(max_llm_calls=1))
+        bm.pre_call_check()  # exhaust the single slot
+        bm.record_usage(TokenUsage(input_tokens=10, output_tokens=5))
+        tool = make_rlm_tool(
+            depth=0, max_depth=2,
+            model=FakeChildWithLLMQueryModel(), budget_manager=bm,
+        )
+        result = tool.forward("classify", "data")
+        assert isinstance(result, str)
+
+
+class TestRLMAgentRecursive:
+    """Tests for RLMAgent with recursive=True wiring."""
+
+    @pytest.mark.parametrize("recursive, expect_rlm", [(False, False), (True, True)])
+    def test_rlm_query_tool_presence(self, recursive, expect_rlm):
+        """rlm_query tool present iff recursive=True."""
+        agent = RLMAgent(model=FakeSubModel(), recursive=recursive)
+        tool_names = [t.name for t in agent.tools.values()]
+        assert ("rlm_query" in tool_names) == expect_rlm
+        assert "llm_query" in tool_names  # always present
+
+    def test_recursive_rlm_tool_starts_at_depth_0(self):
+        """RLMAgent(recursive=True) wires rlm_query at depth 0."""
+        agent = RLMAgent(model=FakeSubModel(), recursive=True)
+        rlm_tool = next(t for t in agent.tools.values() if t.name == "rlm_query")
+        assert rlm_tool.depth == 0
+
+    @pytest.mark.parametrize("recursive, expect_section", [(True, True), (False, False)])
+    def test_instructions_recursive_section(self, recursive, expect_section):
+        """Instructions include/exclude rlm_query docs based on recursive flag."""
+        instructions = _build_rlm_instructions(64_000, recursive=recursive)
+        assert ("Recursive Sub-Tasks" in instructions) == expect_section
+
+    def test_recursive_agent_shares_budget(self):
+        """Budget manager is wired to rlm_query tool."""
+        agent = RLMAgent(model=FakeSubModel(), recursive=True, budget=Budget(max_llm_calls=10))
+        rlm_tool = next(t for t in agent.tools.values() if t.name == "rlm_query")
+        assert rlm_tool.budget_manager is agent.budget_manager
+
+    @pytest.mark.parametrize("param, value, attr", [
+        ("max_depth", 3, "max_depth"),
+        ("max_child_steps", 20, "max_child_steps"),
+    ])
+    def test_recursive_params_forwarded(self, param, value, attr):
+        """Recursive parameters are passed through to RLMQueryTool."""
+        agent = RLMAgent(model=FakeSubModel(), recursive=True, **{param: value})
+        rlm_tool = next(t for t in agent.tools.values() if t.name == "rlm_query")
+        assert getattr(rlm_tool, attr) == value
+
+    def test_max_depth_zero_raises(self):
+        """RLMAgent(recursive=True, max_depth=0) should raise ValueError."""
+        with pytest.raises(ValueError, match="max_depth must be >= 1"):
+            RLMAgent(model=FakeSubModel(), recursive=True, max_depth=0)
+
+    def test_recursive_agent_inherits_authorized_imports(self):
+        """Child agents should inherit additional_authorized_imports from parent."""
+        agent = RLMAgent(
+            model=FakeSubModel(), recursive=True,
+            additional_authorized_imports=["numpy", "pandas"],
+        )
+        rlm_tool = next(t for t in agent.tools.values() if t.name == "rlm_query")
+        assert rlm_tool.additional_authorized_imports == ["numpy", "pandas"]
+
+    def test_authorized_imports_propagate_to_grandchild(self):
+        """Imports propagate through _build_child_tools to deeper levels."""
+        agent = RLMAgent(
+            model=FakeSubModel(), recursive=True, max_depth=3,
+            additional_authorized_imports=["numpy"],
+        )
+        rlm_tool = next(t for t in agent.tools.values() if t.name == "rlm_query")
+        child_tools = rlm_tool._build_child_tools()
+        child_rlm = next(t for t in child_tools if t.name == "rlm_query")
+        assert child_rlm.additional_authorized_imports == ["numpy"]
+
+
+class TestRLMQueryBudgetAccumulation:
+    """Budget accumulates correctly across sequential rlm_query calls."""
+
+    def test_budget_accumulates_across_sequential_calls(self, make_rlm_tool):
+        """Three sequential rlm_query calls exhaust a budget of 3."""
+        sub = FakeSubModel(response="result")
+        bm = BudgetManager(Budget(max_llm_calls=3))
+        tool = make_rlm_tool(
+            depth=0, max_depth=2,
+            model=FakeChildWithLLMQueryModel(), sub_model=sub, budget_manager=bm,
+        )
+        for i in range(3):
+            tool.forward("classify", f"data{i}")
+        assert sub.call_count == 3
+        with pytest.raises(BudgetExceededError):
+            bm.pre_call_check()
+
+    def test_leaf_and_child_calls_share_budget(self, make_rlm_tool):
+        """A leaf flat call and a child's llm_query draw from the same budget."""
+        sub = FakeSubModel(response="done")
+        bm = BudgetManager(Budget(max_llm_calls=2))
+
+        # One leaf call
+        leaf_tool = make_rlm_tool(depth=2, max_depth=2, sub_model=sub, budget_manager=bm)
+        leaf_tool.forward("summarize", "data")
+        assert sub.call_count == 1
+
+        # One child call (child will call llm_query internally)
+        child_tool = make_rlm_tool(
+            depth=0, max_depth=2,
+            model=FakeChildWithLLMQueryModel(), sub_model=sub, budget_manager=bm,
+        )
+        child_tool.forward("classify", "data")
+        assert sub.call_count == 2
+
+        with pytest.raises(BudgetExceededError):
+            bm.pre_call_check()
+
+
+# ---------------------------------------------------------------------------
+# Depth-2 end-to-end recursion
+# ---------------------------------------------------------------------------
+
+
+class FakeDepth2OrchestratorModel(Model):
+    """Model that delegates via rlm_query when it's available, else processes directly.
+
+    At depth 0 (has rlm_query tool): delegates to rlm_query.
+    At depth 1 (no rlm_query tool): reads context and calls final_answer.
+    Distinguishes by checking if 'rlm_query' appears in the system prompt.
+    """
+
+    def generate(self, messages, stop_sequences=None, **kwargs):
+        text = str(messages)
+        # Depth 0: the system prompt mentions rlm_query tool
+        if "rlm_query" in text and "processed:" not in text:
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content='<code>\nresult = rlm_query("count chars", context)\nfinal_answer("root got: " + result)\n</code>',
+                token_usage=TokenUsage(input_tokens=50, output_tokens=20),
+            )
+        # Depth 1 child: peek then answer
+        if "Length:" in text:
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content='<code>\nfinal_answer(f"processed: {len(context)} chars")\n</code>',
+                token_usage=TokenUsage(input_tokens=30, output_tokens=10),
+            )
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content='<code>\nprint(f"Length: {len(context):,} chars")\n</code>',
+            token_usage=TokenUsage(input_tokens=50, output_tokens=15),
+        )
+
+
+class TestDepth2EndToEnd:
+    """Root (depth 0) → child (depth 1) → processes data. Full recursion chain."""
+
+    def test_root_delegates_to_child_via_rlm_query(self):
+        """Root calls rlm_query, child processes context, result flows back."""
+        model = FakeDepth2OrchestratorModel()
+        agent = RLMAgent(
+            model=model, recursive=True, max_depth=2,
+            max_steps=3, max_child_steps=5,
+        )
+        result = agent.run(task="How long is this?", context="hello world")
+        # Root calls rlm_query → child processes → "processed: 11 chars" → root returns
+        assert "11 chars" in str(result)
+
+    def test_child_logging_emits_depth(self, tmp_path):
+        """Child agent steps appear in JSONL log with depth > 0."""
+        path = tmp_path / "depth2.jsonl"
+        model = FakeDepth2OrchestratorModel()
+        agent = RLMAgent(
+            model=model, recursive=True, max_depth=2,
+            max_steps=3, max_child_steps=5,
+            log_path=str(path),
+        )
+        agent.run(task="How long is this?", context="hello world")
+        agent.close()
+
+        events = _read_events(path)
+        # Should have events at depth=0 (root) and depth > 0 (child)
+        depths = {e.get("depth", 0) for e in events}
+        assert 0 in depths, "Should have root-level events"
+        assert any(d > 0 for d in depths), "Should have child-level events"
+
+        # Child execution_result events should exist
+        child_exec = [e for e in events if e["event_type"] == "execution_result" and e.get("depth", 0) > 0]
+        assert len(child_exec) > 0, "Child orchestrator steps should be logged"
