@@ -747,6 +747,22 @@ class TestAgentLogging:
         # At least one exec event should have a reasoning field
         assert any("reasoning" in e for e in exec_events)
 
+    def test_verbose_reasoning_excludes_code_from_reasoning(self, tmp_path):
+        """When model_output starts with <code>, reasoning field is empty, not the code."""
+        path = tmp_path / "code_start.jsonl"
+        # FakeOrchestratorModel outputs '<code>...\n</code>' with no Thought prefix
+        model = FakeOrchestratorModel()
+        agent = RLMAgent(model=model, max_steps=3, log_path=str(path), verbose_reasoning=True)
+        agent.run(task="Count reds", context="Entry 0: red")
+        agent.close()
+
+        events = _read_events(path)
+        exec_events = [e for e in events if e["event_type"] == "execution_result" and "reasoning" in e]
+        for e in exec_events:
+            # Reasoning should never contain actual code
+            assert "<code>" not in e["reasoning"]
+            assert "final_answer" not in e["reasoning"]
+
     def test_no_verbose_reasoning_omits_reasoning_field(self, tmp_path):
         """verbose_reasoning=False (default) omits 'reasoning' from JSONL."""
         path = tmp_path / "no_reasoning.jsonl"
@@ -1342,3 +1358,30 @@ class TestDepth2EndToEnd:
         result = str(agent.run(task="How long is this?", context="hello world"))
         assert "[rlm_query:" in result
         assert "steps" in result
+
+    def test_rlm_query_error_logged_with_timing(self, tmp_path):
+        """When child agent raises, rlm_query error event is logged with wall_time and child_max_steps."""
+        from smolagents.rlm_logging import RLMLogger
+        from smolagents.utils import AgentGenerationError
+
+        path = tmp_path / "error.jsonl"
+        logger = RLMLogger(str(path))
+        # FakeFailingModel raises ConnectionError → child wraps as AgentGenerationError
+        tool = RLMQueryTool(
+            model=FakeFailingModel(), sub_model=FakeSubModel(),
+            depth=0, max_depth=2, budget_manager=None,
+            rlm_logger=logger, max_prompt_chars=None,
+            max_child_steps=5, max_workers=4,
+        )
+        with pytest.raises(AgentGenerationError):
+            tool.forward("will fail", "data")
+        logger.close()
+
+        events = _read_events(path)
+        rlm_errors = [e for e in events if e["event_type"] == "rlm_query" and e.get("error")]
+        assert len(rlm_errors) >= 1, "Should log rlm_query error event"
+        err = rlm_errors[0]
+        assert err["error"] is True
+        assert err["wall_time_s"] >= 0
+        assert err["child_max_steps"] == 5
+        assert err["context_chars"] == len("data")
