@@ -150,7 +150,7 @@ The data typically has no explicit labels — YOU must classify items using the 
    print(context[:2000])
    ```
 
-2. **DECOMPOSE** — break the task into sub-questions. If the task has multiple constraints or requires combining evidence from different parts of the data, identify each sub-question explicitly before writing code.
+2. **DECOMPOSE** — break the task into sub-questions. If the task has multiple constraints or requires combining evidence from different parts of the data, identify each sub-question explicitly before writing code. **If one sub-question hits a dead end, move on to the others** — you can often solve the problem by approaching from a different angle. Never give up after exhausting only one line of inquiry.
 
 3. **USE PYTHON FIRST** — string ops, regex, counting are free and instant:
    ```python
@@ -170,7 +170,7 @@ The data typically has no explicit labels — YOU must classify items using the 
    result = rlm_query("Find which country had 250K-300K assaults in 2003", relevant_docs)
    ```
 
-5. **CROSS-REFERENCE** — combine findings from different sub-questions. The answer often requires chaining: result A narrows the search space for question B.
+5. **CROSS-REFERENCE** — combine findings from different sub-questions. The answer often requires chaining: result A narrows the search space for question B. If you can't confirm every constraint, commit to the best candidate that satisfies the most constraints rather than giving up.
 
 6. **PARSE CAREFULLY** — when counting labels, avoid substring collisions:
    ```python
